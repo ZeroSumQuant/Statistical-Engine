@@ -41,7 +41,6 @@ from abc import ABC, abstractmethod
 # Core dependencies
 try:
     import numpy as np
-    from numpy.typing import ArrayLike
 except Exception as e:
     raise RuntimeError("numpy is required") from e
 
@@ -165,6 +164,7 @@ class ZoneConfig:
     zone_width_alpha_atr: Optional[float] = None
     cluster_width_points: Optional[float] = None  # New: for decoupling clustering from trade width
     tick_size: float = 0.25  # Instrument-specific tick size
+    null_width_multiplier: float = 1.5 # Multiplier for significance test width
     expire_days: int = 30
     merge_tolerance_points: float = 2.0
     min_touches_for_significance: int = 2
@@ -539,7 +539,10 @@ class EpisodeDetector:
     def detect_episode(self, df: pd.DataFrame, zone: Dict[str, Any], start_idx: int) -> Optional[Dict[str, Any]]:
         """Detect episode for a zone starting from start_idx"""
         state = SearchingForTouch()
-        bar_dt = (df["timestamp"].diff().median() or pd.Timedelta(minutes=1))
+        bar_dt = df["timestamp"].diff().median()
+        if pd.isna(bar_dt) or bar_dt <= pd.Timedelta(0):
+            bar_dt = pd.Timedelta(minutes=1)
+
         context = {
             "df": df, # Pass full dataframe to context
             "zone": zone,
@@ -715,7 +718,7 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
                     is_significant, p_value = False, 1.0
                 else:
                     # Use a wider test width for the null hypothesis to make the test more conservative
-                    width_for_test = max(width, (config.cluster_width_points or width) * 1.5)
+                    width_for_test = max(width, (config.cluster_width_points or width) * config.null_width_multiplier)
                     local_prices = pd.concat([local_prices_df['high'], local_prices_df['low']])
                     is_significant, p_value = test_zone_significance(
                         touches, level, width_for_test, local_prices
@@ -1268,6 +1271,21 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
     LOG.info("Daily maps saved.")
 
 
+def ensure_prepared(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
+    """Checks if data has been prepared, and if not, runs preparation steps."""
+    need_sessions = any(c not in df.columns for c in ["session_date","minute_of_day","is_rth","local_time"])
+    if need_sessions:
+        LOG.info("Input data is missing session columns, running annotate_sessions...")
+        df = annotate_sessions(df, config.session)
+
+    need_ind = any(c not in df.columns for c in ["atr","rsi","rvol"])
+    if need_ind:
+        LOG.info("Input data is missing indicator columns, running add_indicators...")
+        df = add_indicators(df, config.indicators)
+
+    return df
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="market_stats_engine",
@@ -1349,12 +1367,18 @@ def main():
 
         # Save prepared data
         # Output directory is already created by metadata logic
-        if args.out.endswith(".parquet") and HAVE_PARQUET:
-            df.to_parquet(args.out, index=False)
+        out_path = args.out
+        if out_path.endswith(".parquet"):
+            if HAVE_PARQUET:
+                df.to_parquet(out_path, index=False)
+            else:
+                out_path = out_path.replace(".parquet", ".csv")
+                df.to_csv(out_path, index=False)
+                LOG.warning("pyarrow not found, saving as CSV instead.")
         else:
-            df.to_csv(args.out.replace(".parquet", ".csv"), index=False)
+            df.to_csv(out_path, index=False)
 
-        LOG.info(f"Saved prepared data to {args.out}")
+        LOG.info(f"Saved prepared data to {out_path}")
         LOG.info(f"Shape: {df.shape}")
         LOG.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
 
@@ -1367,6 +1391,8 @@ def main():
         else:
             df = pd.read_csv(args.data, parse_dates=["timestamp"])
 
+        df = ensure_prepared(df, config)
+
         # Run analysis
         results = run_analysis(df, config)
 
@@ -1374,18 +1400,17 @@ def main():
         # Output directory is already created by metadata logic
 
         # Save zones
-        zones_data = [
-            {
-                "id": z.id,
-                "type": z.type.value,
-                "level": z.level,
-                "width": z.width,
-                "p_value": z.p_value,
-                "is_significant": z.is_significant,
-                "n_touches": len(z.touches)
-            }
-            for z in results["zones"]
-        ]
+        zones_data = [{
+            "id": z.id,
+            "type": z.type.value,
+            "level": z.level,
+            "width": z.width,
+            "p_value": z.p_value,
+            "is_significant": z.is_significant,
+            "n_touches": len(z.touches),
+            "activation_time": z.activation_time.isoformat(),
+            "expiry_time": (z.activation_time + pd.Timedelta(days=z.expire_days)).isoformat(),
+        } for z in results["zones"]]
         pd.DataFrame(zones_data).to_csv(f"{args.out}/zones.csv", index=False)
 
         # Save episodes
@@ -1429,6 +1454,8 @@ def main():
             df = pd.read_parquet(args.data)
         else:
             df = pd.read_csv(args.data, parse_dates=["timestamp"])
+
+        df = ensure_prepared(df, config)
 
         # Load parameter grid
         LOG.info(f"Loading parameter grid from {args.grid}")
