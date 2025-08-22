@@ -171,6 +171,7 @@ class ZoneConfig:
     pivot_k: int = 5
     zone_width_points: Optional[float] = 15.0
     zone_width_alpha_atr: Optional[float] = None
+    cluster_width_points: Optional[float] = None  # New: for decoupling clustering from trade width
     expire_days: int = 30
     merge_tolerance_points: float = 2.0
     min_touches_for_significance: int = 2
@@ -185,6 +186,11 @@ class ZoneConfig:
             raise ValueError("Zone width ATR multiplier must be positive")
         if self.zone_width_points is None and self.zone_width_alpha_atr is None:
             self.zone_width_points = 15.0  # Default
+
+        if self.cluster_width_points is None:
+            self.cluster_width_points = self.zone_width_points
+        elif self.cluster_width_points <= 0:
+            raise ValueError("Cluster width must be positive")
 
 @dataclass
 class EpisodeConfig:
@@ -259,6 +265,15 @@ class DataValidator:
             if invalid_mask.any():
                 LOG.warning(f"Removing {invalid_mask.sum()} bars with invalid OHLC relationships")
                 df = df[~invalid_mask].copy()
+
+        # Price change validation
+        if self.config.max_price_change_pct > 0:
+            pct_change = df["close"].pct_change().abs() * 100
+            too_big_mask = pct_change > self.config.max_price_change_pct
+            if too_big_mask.any():
+                report["price_spike"] = int(too_big_mask.sum())
+                LOG.warning(f"Removing {report['price_spike']} bars with >{self.config.max_price_change_pct}% move")
+                df = df[~too_big_mask].copy()
 
         # Volume validation
         if self.config.min_volume > 0:
@@ -452,9 +467,16 @@ class SearchingForTouch(EpisodeState):
 class TrackingOutcome(EpisodeState):
     """State: tracking price after touch to determine outcome"""
     def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional[EpisodeState]]:
+        config = context["config"]
+        # Check for stale data within an episode
+        if config["max_gap_bars"] > 0:
+            if context["current_idx"] - context.get("last_seen_idx", context["current_idx"]) > config["max_gap_bars"]:
+                LOG.debug(f"Invalidating episode due to stale data (gap > {config['max_gap_bars']} bars)")
+                return EpisodeOutcome.INVALID, None
+        context["last_seen_idx"] = context["current_idx"]
+
         bar = context["bar"]
         zone = context["zone"]
-        config = context["config"]
 
         band_low = zone["level"] - zone["width"]
         band_high = zone["level"] + zone["width"]
@@ -684,15 +706,24 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
 
             # Test significance if enabled
             if config.significance_test:
-                first_pivot_time = min(p['center_time'] for p in cluster)
-                last_pivot_time = max(p['center_time'] for p in cluster)
-                local_prices_df = df[(df['timestamp'] >= first_pivot_time) & (df['timestamp'] <= last_pivot_time)]
+                # Define a wider, more appropriate null window for the significance test.
+                # The window is the full price range of the session(s) the cluster spans.
+                min_time = min(p['center_time'] for p in cluster)
+                max_time = max(p['center_time'] for p in cluster)
+
+                # Find all unique session dates the cluster's pivots fall into.
+                sessions_spanned = df[(df['timestamp'] >= min_time) & (df['timestamp'] <= max_time)]['session_date'].unique()
+
+                # Get all price data from those sessions to form the null distribution.
+                local_prices_df = df[df['session_date'].isin(sessions_spanned)]
 
                 if local_prices_df.empty:
                     is_significant, p_value = False, 1.0
                 else:
                     local_prices = pd.concat([local_prices_df['high'], local_prices_df['low']])
-                    is_significant, p_value = test_zone_significance(touches, level, width, local_prices)
+                    is_significant, p_value = test_zone_significance(
+                        touches, level, width, local_prices
+                    )
 
                 if not is_significant:
                     LOG.debug(f"Zone at {level:.2f} not significant (p={p_value:.3f}, {len(touches)} touches)")
@@ -725,28 +756,41 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
     return final_zones
 
 def detect_pivots(df: pd.DataFrame, k: int) -> List[Dict[str, Any]]:
-    """Detect pivots with look-ahead safety"""
+    """Detect pivots with look-ahead safety and tolerance."""
     pivots = []
-    for i in range(k, len(df) - k):
-        window = df.iloc[i-k:i+k+1]
+    tick = 0.25  # Standard tick size for NQ futures
 
-        # Check for high pivot
-        if df.iloc[i]["high"] == window["high"].max():
+    hi = df["high"].values
+    lo = df["low"].values
+    ts = df["timestamp"].values
+
+    for i in range(k, len(df) - k):
+        window_hi = hi[i-k:i+k+1]
+        window_lo = lo[i-k:i+k+1]
+
+        # Check for high pivot with tolerance
+        is_high_pivot = (hi[i] >= window_hi.max() - tick) and \
+                        (hi[i] > hi[i-1] or i==0) and \
+                        (hi[i] >= hi[i+1] or i==len(df)-1)
+        if is_high_pivot:
             pivots.append({
                 "type": "HIGH",
-                "price": df.iloc[i]["high"],
-                "center_time": df.iloc[i]["timestamp"],
-                "confirm_time": df.iloc[i+k]["timestamp"],
+                "price": hi[i],
+                "center_time": ts[i],
+                "confirm_time": ts[i+k],
                 "index": i
             })
 
-        # Check for low pivot
-        if df.iloc[i]["low"] == window["low"].min():
+        # Check for low pivot with tolerance
+        is_low_pivot = (lo[i] <= window_lo.min() + tick) and \
+                       (lo[i] < lo[i-1] or i==0) and \
+                       (lo[i] <= lo[i+1] or i==len(df)-1)
+        if is_low_pivot:
             pivots.append({
                 "type": "LOW",
-                "price": df.iloc[i]["low"],
-                "center_time": df.iloc[i]["timestamp"],
-                "confirm_time": df.iloc[i+k]["timestamp"],
+                "price": lo[i],
+                "center_time": ts[i],
+                "confirm_time": ts[i+k],
                 "index": i
             })
 
@@ -764,7 +808,7 @@ def cluster_pivots(pivots: List[Dict], config: ZoneConfig) -> List[List[Dict]]:
     for pivot in sorted_pivots[1:]:
         # Check if pivot belongs to current cluster
         cluster_center = np.mean([p["price"] for p in current_cluster])
-        width = config.zone_width_points or 15.0
+        width = config.cluster_width_points or 15.0 # Use dedicated clustering width
 
         if abs(pivot["price"] - cluster_center) <= width:
             current_cluster.append(pivot)
@@ -1176,6 +1220,15 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
         episodes_df["touch_time"] = pd.to_datetime(episodes_df["touch_time"])
         episodes_df["outcome_time"] = pd.to_datetime(episodes_df["outcome_time"])
 
+    local_tz = df["local_time"].dt.tz
+    if local_tz is None:
+        LOG.warning("Cannot determine local timezone for plotting, daily maps may be incorrect.")
+        # Fallback to UTC if no timezone info
+        local_tz = dt.timezone.utc
+
+    def to_local_date(ts):
+        return ts.tz_convert(local_tz).date() if hasattr(ts, "tz_convert") else ts.date()
+
     for session, day_df in df.groupby("session_date"):
         fig, ax = plt.subplots(figsize=(15, 8))
 
@@ -1184,8 +1237,9 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
 
         # Plot active zones
         for zone in zones:
-            zone_expiry = zone.activation_time + pd.Timedelta(days=zone.expire_days)
-            if zone.activation_time.date() <= session and zone_expiry.date() >= session:
+            zone_act_local = to_local_date(zone.activation_time)
+            zone_exp_local = to_local_date(zone.activation_time + pd.Timedelta(days=zone.expire_days))
+            if zone_act_local <= session <= zone_exp_local:
                 color = 'green' if zone.type == ZoneType.SUPPORT else 'red'
                 ax.axhspan(zone.level - zone.width, zone.level + zone.width, alpha=0.1, color=color)
                 ax.axhline(zone.level, color=color, linestyle='--', linewidth=0.7)
@@ -1194,13 +1248,15 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
         if not episodes_df.empty:
             day_episodes = episodes_df[episodes_df["touch_time"].dt.date == session]
             for _, episode in day_episodes.iterrows():
-                outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(episode['outcome'].value, 'grey')
+                outcome = episode['outcome']
+                label = outcome.value if hasattr(outcome, "value") else str(outcome)
+                outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(label, 'grey')
 
                 touch_bars = df[df['timestamp'] == episode['touch_time']]
                 if not touch_bars.empty:
                     touch_price = touch_bars['close'].iloc[0]
                     ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
-                    ax.text(episode['outcome_time'], touch_price, episode['outcome'].value, color=outcome_color)
+                    ax.text(episode['outcome_time'], touch_price, label, color=outcome_color)
 
         ax.set_title(f"Market Map for {session.strftime('%Y-%m-%d')}")
         ax.set_ylabel("Price")
@@ -1407,10 +1463,14 @@ def main():
             if n_episodes > 0:
                 summary_row.update({
                     "n_episodes": n_episodes,
+                    "n_invalid": all_stats.get("n_invalid_episodes", 0),
                     "respect_rate": all_stats.get("outcome_rates", {}).get("RESPECT"),
+                    "pierce_revert_rate": all_stats.get("outcome_rates", {}).get("PIERCE_AND_REVERT"),
                     "break_rate": all_stats.get("outcome_rates", {}).get("BREAK"),
                     "timeout_rate": all_stats.get("outcome_rates", {}).get("TIMEOUT"),
                 })
+            else:
+                summary_row.update({"n_episodes": 0, "n_invalid": all_stats.get("n_invalid_episodes", 0)})
             summary_results.append(summary_row)
 
         # Save summary
