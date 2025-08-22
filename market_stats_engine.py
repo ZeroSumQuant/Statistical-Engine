@@ -271,35 +271,39 @@ class DataValidator:
         # Outlier detection
         df["is_outlier"] = False
         if self.config.remove_outliers:
-            returns = df["close"].pct_change()
+            df["returns"] = df["close"].pct_change()
 
-            # Use a more robust MAD-based threshold per session
-            # Ensure session_date exists from the new prepare_data order
             if "session_date" in df.columns:
-                mad = df.groupby("session_date")['returns'].transform(lambda x: (x - x.median()).abs().median())
+                # Compute MAD of returns per session, which is more robust to outliers
+                mad = df.groupby("session_date")["returns"].transform(lambda x: (x - x.median()).abs().median())
                 # 1.4826 scales MAD to be like STD for a normal distribution
-                outlier_threshold = self.config.outlier_std_threshold * mad * 1.4826
-                outliers = returns.abs() > outlier_threshold
+                # Add a small epsilon to avoid division by zero or issues with flat series
+                outlier_threshold = self.config.outlier_std_threshold * mad * 1.4826 + 1e-9
+                outliers = df["returns"].abs() > outlier_threshold
             else:
                 # Fallback if session_date is not available
-                outlier_threshold = returns.std() * self.config.outlier_std_threshold
-                outliers = returns.abs() > outlier_threshold
+                outlier_threshold = df["returns"].std() * self.config.outlier_std_threshold
+                outliers = df["returns"].abs() > outlier_threshold
 
             report["outliers"] = outliers.sum()
             if outliers.any():
                 LOG.info(f"Flagging {outliers.sum()} outlier bars")
                 df.loc[outliers, "is_outlier"] = True
 
+            # Drop the temporary returns column
+            df = df.drop(columns=["returns"])
+
         # Gap detection
         if self.config.handle_gaps:
+            same_session = df["session_date"] == df["session_date"].shift(1)
             time_diff = df["timestamp"].diff()
-            expected_freq = pd.Timedelta(minutes=1)  # Assuming 1-minute bars
-            gaps = time_diff > pd.Timedelta(minutes=self.config.max_gap_minutes)
-            report["gaps_detected"] = gaps.sum()
-            if gaps.any():
-                LOG.info(f"Detected {gaps.sum()} gaps > {self.config.max_gap_minutes} minutes")
-                # Mark gap bars for episode detection
-                df["has_gap"] = gaps
+
+            gaps = same_session & (time_diff > pd.Timedelta(minutes=self.config.max_gap_minutes))
+            df["has_gap"] = gaps.fillna(False)
+            report["gaps_detected"] = int(gaps.sum())
+
+            if report["gaps_detected"] > 0:
+                LOG.info(f"Detected {report['gaps_detected']} intra-session gaps > {self.config.max_gap_minutes} minutes")
         else:
             df["has_gap"] = False
 
@@ -348,7 +352,9 @@ def test_zone_significance(touches: List[float], level: float, width: float,
 def block_bootstrap_ci(data: np.ndarray, statistic_func, n_boot: int = 5000,
                        block_size: int = BOOTSTRAP_BLOCK_SIZE, alpha: float = 0.05) -> Tuple[float, float]:
     """
-    Block bootstrap for confidence intervals accounting for serial correlation
+    Circular moving block bootstrap for confidence intervals.
+    This method is more robust for time series data as it preserves dependencies
+    and handles edge effects by wrapping the data in a circle.
     """
     n = len(data)
     if n < block_size:
@@ -356,19 +362,23 @@ def block_bootstrap_ci(data: np.ndarray, statistic_func, n_boot: int = 5000,
         return standard_bootstrap_ci(data, statistic_func, n_boot, alpha)
 
     rng = np.random.default_rng(42)
-    n_blocks = n // block_size
     bootstrap_stats = []
 
-    for _ in range(n_boot):
-        # Sample blocks with replacement
-        block_indices = rng.choice(n_blocks, size=n_blocks, replace=True)
-        resampled_data = []
-        for idx in block_indices:
-            start = idx * block_size
-            end = min(start + block_size, n)
-            resampled_data.extend(data[start:end])
+    # Extended series for circular wrapping
+    extended_data = np.concatenate([data, data[:block_size - 1]])
 
-        bootstrap_stats.append(statistic_func(np.array(resampled_data)))
+    for _ in range(n_boot):
+        # Number of blocks needed to create a series of length n
+        num_blocks = math.ceil(n / block_size)
+
+        # Sample random block start indices
+        start_indices = rng.integers(0, n, size=num_blocks)
+
+        # Create resampled data by taking blocks and trimming to original length
+        resampled_indices = np.concatenate([np.arange(s, s + block_size) for s in start_indices])[:n]
+        resampled_data = extended_data[resampled_indices]
+
+        bootstrap_stats.append(statistic_func(resampled_data))
 
     bootstrap_stats = np.array(bootstrap_stats)
     ci_lower = np.percentile(bootstrap_stats, 100 * alpha / 2)
@@ -542,6 +552,11 @@ class EpisodeDetector:
 
             outcome, next_state = state.process_bar(context)
 
+            # If state changed (e.g., from Searching to Tracking), re-process the same bar
+            if next_state is not state and next_state is not None:
+                state = next_state
+                outcome, next_state = state.process_bar(context)
+
             if outcome is not None:
                 # Terminal state reached
                 return {
@@ -572,6 +587,48 @@ class EpisodeDetector:
 
 # ————————— Zone Detection with Significance Testing —————————
 
+def merge_close_zones(zones: List['Zone'], tolerance: float, config: 'ZoneConfig') -> List['Zone']:
+    """Merges zones that are closer than the given tolerance."""
+    if not zones:
+        return []
+
+    # Sort zones by level to easily find adjacent ones
+    sorted_zones = sorted(zones, key=lambda z: z.level)
+
+    merged_zones = [sorted_zones[0]]
+
+    for current_zone in sorted_zones[1:]:
+        prev_zone = merged_zones[-1]
+
+        if abs(current_zone.level - prev_zone.level) <= tolerance:
+            # Merge the current zone into the previous one
+            total_touches = len(prev_zone.touches) + len(current_zone.touches)
+            if total_touches == 0: continue
+
+            # Weighted average for the new level
+            new_level = ((prev_zone.level * len(prev_zone.touches)) +
+                         (current_zone.level * len(current_zone.touches))) / total_touches
+
+            new_touches = prev_zone.touches + current_zone.touches
+            new_p_value = min(prev_zone.p_value, current_zone.p_value)
+            new_activation_time = min(prev_zone.activation_time, current_zone.activation_time)
+            new_width = (prev_zone.width + current_zone.width) / 2.0
+
+            # Update the last zone in the merged list
+            merged_zones[-1] = dataclasses.replace(
+                prev_zone,
+                level=new_level,
+                touches=new_touches,
+                p_value=new_p_value,
+                activation_time=new_activation_time,
+                width=new_width
+            )
+        else:
+            # No merge, just add the new zone
+            merged_zones.append(current_zone)
+
+    return merged_zones
+
 @dataclass
 class Zone:
     id: int
@@ -586,10 +643,11 @@ class Zone:
 
 def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List[Zone]:
     """Detect zones with statistical significance testing"""
+    """Detect zones with statistical significance testing"""
     # Detect pivots first
     pivots = detect_pivots(df, config.pivot_k)
 
-    zones = []
+    final_zones = []
     zone_id = 1
 
     # Group pivots by type
@@ -599,7 +657,7 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
     for pivot_list, zone_type in [(high_pivots, ZoneType.RESISTANCE),
                                (low_pivots, ZoneType.SUPPORT)]:
 
-        # Cluster pivots
+        zones_this_type = []
         clusters = cluster_pivots(pivot_list, config)
 
         for cluster in clusters:
@@ -608,23 +666,33 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
 
             touches = [p["price"] for p in cluster]
             level = np.mean(touches)
-            width = config.zone_width_points or 15.0
+
+            # Calculate zone width: either fixed or ATR-based
+            if config.zone_width_alpha_atr is not None:
+                t0 = min(p["center_time"] for p in cluster)
+                t1 = max(p["center_time"] for p in cluster)
+                local_df = df[(df["timestamp"] >= t0) & (df["timestamp"] <= t1)]
+
+                if not local_df.empty and not local_df["atr"].isnull().all():
+                    atr_ref = float(local_df["atr"].median())
+                else:
+                    atr_ref = float(df["atr"].median())
+
+                width = max(1e-9, config.zone_width_alpha_atr * atr_ref)
+            else:
+                width = config.zone_width_points or 15.0
 
             # Test significance if enabled
             if config.significance_test:
-                # Define local price window based on the time range of the pivots in the cluster
                 first_pivot_time = min(p['center_time'] for p in cluster)
                 last_pivot_time = max(p['center_time'] for p in cluster)
                 local_prices_df = df[(df['timestamp'] >= first_pivot_time) & (df['timestamp'] <= last_pivot_time)]
 
-                # Use high and low prices in the local window to define the price range
                 if local_prices_df.empty:
                     is_significant, p_value = False, 1.0
                 else:
                     local_prices = pd.concat([local_prices_df['high'], local_prices_df['low']])
-                    is_significant, p_value = test_zone_significance(
-                        touches, level, width, local_prices
-                    )
+                    is_significant, p_value = test_zone_significance(touches, level, width, local_prices)
 
                 if not is_significant:
                     LOG.debug(f"Zone at {level:.2f} not significant (p={p_value:.3f}, {len(touches)} touches)")
@@ -633,26 +701,28 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
                 is_significant = True
                 p_value = 0.0
 
-            # Zone is significant, add it
-            activation_time = cluster[1]["confirm_time"] if len(cluster) > 1 else cluster[0]["confirm_time"]
+            # Sort by time to find the true activation time (confirmation of the second touch)
+            cluster_sorted_by_time = sorted(cluster, key=lambda p: p["confirm_time"])
+            activation_time = cluster_sorted_by_time[1]["confirm_time"] if len(cluster) > 1 else cluster_sorted_by_time[0]["confirm_time"]
 
             zone = Zone(
-                id=zone_id,
-                type=zone_type,
-                level=level,
-                width=width,
-                activation_time=activation_time,
-                touches=touches,
-                p_value=p_value,
-                is_significant=is_significant,
-                expire_days=config.expire_days
+                id=zone_id, type=zone_type, level=level, width=width,
+                activation_time=activation_time, touches=touches, p_value=p_value,
+                is_significant=is_significant, expire_days=config.expire_days
             )
-
-            zones.append(zone)
+            zones_this_type.append(zone)
             zone_id += 1
 
-    LOG.info(f"Detected {len(zones)} statistically significant zones")
-    return zones
+        # Merge close zones of the same type
+        if config.merge_tolerance_points > 0 and zones_this_type:
+            num_before_merge = len(zones_this_type)
+            zones_this_type = merge_close_zones(zones_this_type, config.merge_tolerance_points, config)
+            LOG.info(f"Merged {num_before_merge - len(zones_this_type)} {zone_type.value} zones.")
+
+        final_zones.extend(zones_this_type)
+
+    LOG.info(f"Detected {len(final_zones)} statistically significant zones after merging.")
+    return final_zones
 
 def detect_pivots(df: pd.DataFrame, k: int) -> List[Dict[str, Any]]:
     """Detect pivots with look-ahead safety"""
@@ -939,62 +1009,68 @@ def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
 
 def compute_statistics(episodes: List[Dict], config: EngineConfig, alpha: float = 0.05) -> Dict[str, Any]:
     """Compute statistics with proper confidence intervals"""
-    n_episodes = len(episodes)
-
-    if n_episodes == 0:
-        return {"n_episodes": 0, "outcome_distribution": {}, "outcome_rates": {}, "outcome_rates_ci": {}}
-
-    if n_episodes < MIN_EPISODES_FOR_STATS:
-        LOG.debug(f"Too few episodes ({n_episodes}) for full stats, computing basics.")
-
-    outcomes = np.array([e["outcome"].value for e in episodes])
-
-    # --- Outcome rates and CIs ---
-    outcome_rates = {}
-    outcome_rates_ci = {}
-    for outcome in EpisodeOutcome:
-        count = np.sum(outcomes == outcome.value)
-        rate = count / n_episodes if n_episodes > 0 else 0
-        outcome_rates[outcome.value] = rate
-
-        if HAVE_SCIPY and n_episodes > 0:
-            # Clopper-Pearson interval for binomial proportion
-            ci_low, ci_high = scipy_stats.binom.interval(1 - alpha, n_episodes, rate)
-            outcome_rates_ci[outcome.value] = (ci_low / n_episodes, ci_high / n_episodes)
-        else:
-            outcome_rates_ci[outcome.value] = (None, None)
-
-    # --- Bootstrap CIs for metrics ---
-    bootstrapped_metrics = {}
-    if n_episodes >= MIN_EPISODES_FOR_STATS:
-        metrics_to_bootstrap = ["bars_to_outcome", "max_favorable", "max_adverse"]
-        for metric_name in metrics_to_bootstrap:
-            data = np.array([e[metric_name] for e in episodes if e.get(metric_name) is not None])
-            if len(data) > 1:
-                median_val = np.median(data)
-                mean_val = np.mean(data)
-
-                # Use a smaller n_boot for performance as this is called many times in stratification
-                block_size = config.episode.T // 2 or 5
-                ci_median = block_bootstrap_ci(data, np.median, n_boot=1000, block_size=block_size)
-                ci_mean = block_bootstrap_ci(data, np.mean, n_boot=1000, block_size=block_size)
-
-                bootstrapped_metrics[metric_name] = {
-                    "mean": mean_val, "mean_ci": ci_mean,
-                    "median": median_val, "median_ci": ci_median,
-                    "p25": np.percentile(data, 25), "p75": np.percentile(data, 75)
-                }
+    # Separate valid from invalid episodes for cleaner statistics
+    valid_episodes = [e for e in episodes if e["outcome"] != EpisodeOutcome.INVALID]
+    n_invalid = len(episodes) - len(valid_episodes)
+    n_episodes = len(valid_episodes)
 
     stats = {
         "n_episodes": n_episodes,
-        "outcome_distribution": {
-            outcome.value: int(np.sum(outcomes == outcome.value))
-            for outcome in EpisodeOutcome
-        },
-        "outcome_rates": outcome_rates,
-        "outcome_rates_ci": outcome_rates_ci,
-        "bootstrapped_metrics": bootstrapped_metrics
+        "n_invalid_episodes": n_invalid,
+        "outcome_distribution": {},
+        "outcome_rates": {},
+        "outcome_rates_ci": {},
+        "bootstrapped_metrics": {}
     }
+
+    if n_episodes == 0:
+        return stats
+
+    if n_episodes < MIN_EPISODES_FOR_STATS:
+        LOG.debug(f"Too few valid episodes ({n_episodes}) for full stats, computing basics.")
+
+    outcomes = np.array([e["outcome"].value for e in valid_episodes])
+
+    # --- Outcome rates and CIs ---
+    for outcome in EpisodeOutcome:
+        if outcome == EpisodeOutcome.INVALID:
+            continue
+
+        count = np.sum(outcomes == outcome.value)
+        stats["outcome_distribution"][outcome.value] = int(count)
+
+        rate = count / n_episodes if n_episodes > 0 else 0
+        stats["outcome_rates"][outcome.value] = rate
+
+        if HAVE_SCIPY and n_episodes > 0:
+            from scipy.stats import beta
+            k = int(count)
+            if k == 0:
+                ci_low, ci_high = 0.0, beta.ppf(1 - alpha / 2, 1, n_episodes)
+            elif k == n_episodes:
+                ci_low, ci_high = beta.ppf(alpha / 2, n_episodes, 1), 1.0
+            else:
+                ci_low = beta.ppf(alpha / 2, k, n_episodes - k + 1)
+                ci_high = beta.ppf(1 - alpha / 2, k + 1, n_episodes - k)
+            stats["outcome_rates_ci"][outcome.value] = (ci_low, ci_high)
+        else:
+            stats["outcome_rates_ci"][outcome.value] = (None, None)
+
+    # --- Bootstrap CIs for metrics ---
+    if n_episodes >= MIN_EPISODES_FOR_STATS:
+        metrics_to_bootstrap = ["bars_to_outcome", "max_favorable", "max_adverse"]
+        for metric_name in metrics_to_bootstrap:
+            data = np.array([e[metric_name] for e in valid_episodes if e.get(metric_name) is not None])
+            if len(data) > 1:
+                block_size = config.episode.T // 2 or 5
+                stats["bootstrapped_metrics"][metric_name] = {
+                    "mean": np.mean(data),
+                    "mean_ci": block_bootstrap_ci(data, np.mean, n_boot=1000, block_size=block_size),
+                    "median": np.median(data),
+                    "median_ci": block_bootstrap_ci(data, np.median, n_boot=1000, block_size=block_size),
+                    "p25": np.percentile(data, 25),
+                    "p75": np.percentile(data, 75)
+                }
     return stats
 
 # ————————— CLI Interface —————————
