@@ -27,16 +27,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any, Protocol, Union
+from typing import Optional, List, Tuple, Dict, Any
 import datetime as dt
 import json
 import math
 import os
 import sys
-import glob
-import warnings
 import logging
-import itertools
 import hashlib
 from enum import Enum
 from abc import ABC, abstractmethod
@@ -80,11 +77,6 @@ try:
 except:
     HAVE_YAML = False
 
-try:
-    from numba import njit, jit
-    HAVE_NUMBA = True
-except:
-    HAVE_NUMBA = False
 
 try:
     from zoneinfo import ZoneInfo
@@ -172,6 +164,7 @@ class ZoneConfig:
     zone_width_points: Optional[float] = 15.0
     zone_width_alpha_atr: Optional[float] = None
     cluster_width_points: Optional[float] = None  # New: for decoupling clustering from trade width
+    tick_size: float = 0.25  # Instrument-specific tick size
     expire_days: int = 30
     merge_tolerance_points: float = 2.0
     min_touches_for_significance: int = 2
@@ -468,12 +461,12 @@ class TrackingOutcome(EpisodeState):
     """State: tracking price after touch to determine outcome"""
     def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional[EpisodeState]]:
         config = context["config"]
-        # Check for stale data within an episode
-        if config["max_gap_bars"] > 0:
-            if context["current_idx"] - context.get("last_seen_idx", context["current_idx"]) > config["max_gap_bars"]:
-                LOG.debug(f"Invalidating episode due to stale data (gap > {config['max_gap_bars']} bars)")
+        # Check for stale data within an episode using timestamps
+        if config["max_gap_bars"] > 0 and "prev_ts" in context:
+            if (context["bar"]["timestamp"] - context["prev_ts"]) > (context["bar_dt"] * config["max_gap_bars"]):
+                LOG.debug("Invalidating episode due to timestamp gap")
                 return EpisodeOutcome.INVALID, None
-        context["last_seen_idx"] = context["current_idx"]
+        context["prev_ts"] = context["bar"]["timestamp"]
 
         bar = context["bar"]
         zone = context["zone"]
@@ -546,10 +539,12 @@ class EpisodeDetector:
     def detect_episode(self, df: pd.DataFrame, zone: Dict[str, Any], start_idx: int) -> Optional[Dict[str, Any]]:
         """Detect episode for a zone starting from start_idx"""
         state = SearchingForTouch()
+        bar_dt = (df["timestamp"].diff().median() or pd.Timedelta(minutes=1))
         context = {
             "df": df, # Pass full dataframe to context
             "zone": zone,
             "config": dataclasses.asdict(self.config),
+            "bar_dt": bar_dt,
             "touch_idx": None,
             "touch_time": None,
             "from_above": None,
@@ -665,9 +660,8 @@ class Zone:
 
 def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List[Zone]:
     """Detect zones with statistical significance testing"""
-    """Detect zones with statistical significance testing"""
     # Detect pivots first
-    pivots = detect_pivots(df, config.pivot_k)
+    pivots = detect_pivots(df, config.pivot_k, config)
 
     final_zones = []
     zone_id = 1
@@ -720,9 +714,11 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
                 if local_prices_df.empty:
                     is_significant, p_value = False, 1.0
                 else:
+                    # Use a wider test width for the null hypothesis to make the test more conservative
+                    width_for_test = max(width, (config.cluster_width_points or width) * 1.5)
                     local_prices = pd.concat([local_prices_df['high'], local_prices_df['low']])
                     is_significant, p_value = test_zone_significance(
-                        touches, level, width, local_prices
+                        touches, level, width_for_test, local_prices
                     )
 
                 if not is_significant:
@@ -755,14 +751,14 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
     LOG.info(f"Detected {len(final_zones)} statistically significant zones after merging.")
     return final_zones
 
-def detect_pivots(df: pd.DataFrame, k: int) -> List[Dict[str, Any]]:
+def detect_pivots(df: pd.DataFrame, k: int, config: ZoneConfig) -> List[Dict[str, Any]]:
     """Detect pivots with look-ahead safety and tolerance."""
     pivots = []
-    tick = 0.25  # Standard tick size for NQ futures
+    tick = config.tick_size
 
     hi = df["high"].values
     lo = df["low"].values
-    ts = df["timestamp"].values
+    ts = df["timestamp"]  # Keep as a Series to preserve Timestamp objects
 
     for i in range(k, len(df) - k):
         window_hi = hi[i-k:i+k+1]
@@ -770,27 +766,27 @@ def detect_pivots(df: pd.DataFrame, k: int) -> List[Dict[str, Any]]:
 
         # Check for high pivot with tolerance
         is_high_pivot = (hi[i] >= window_hi.max() - tick) and \
-                        (hi[i] > hi[i-1] or i==0) and \
-                        (hi[i] >= hi[i+1] or i==len(df)-1)
+                        (hi[i] > hi[i-1]) and \
+                        (hi[i] >= hi[i+1])
         if is_high_pivot:
             pivots.append({
                 "type": "HIGH",
                 "price": hi[i],
-                "center_time": ts[i],
-                "confirm_time": ts[i+k],
+                "center_time": ts.iat[i],
+                "confirm_time": ts.iat[i+k],
                 "index": i
             })
 
         # Check for low pivot with tolerance
         is_low_pivot = (lo[i] <= window_lo.min() + tick) and \
-                       (lo[i] < lo[i-1] or i==0) and \
-                       (lo[i] <= lo[i+1] or i==len(df)-1)
+                       (lo[i] < lo[i-1]) and \
+                       (lo[i] <= lo[i+1])
         if is_low_pivot:
             pivots.append({
                 "type": "LOW",
                 "price": lo[i],
-                "center_time": ts[i],
-                "confirm_time": ts[i+k],
+                "center_time": ts.iat[i],
+                "confirm_time": ts.iat[i+k],
                 "index": i
             })
 
@@ -834,7 +830,9 @@ def prepare_data(files: List[str], config: EngineConfig) -> pd.DataFrame:
 
         # Load file
         if file.endswith(".parquet"):
-            df = pd.read_parquet(file) if HAVE_PARQUET else pd.read_csv(file)
+            if not HAVE_PARQUET:
+                raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
+            df = pd.read_parquet(file)
         else:
             df = pd.read_csv(file)
 
@@ -1222,12 +1220,14 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
 
     local_tz = df["local_time"].dt.tz
     if local_tz is None:
-        LOG.warning("Cannot determine local timezone for plotting, daily maps may be incorrect.")
-        # Fallback to UTC if no timezone info
-        local_tz = dt.timezone.utc
+        LOG.warning("local_time has no tz; assuming UTC for plotting.")
+        local_tz = "UTC"
 
     def to_local_date(ts):
-        return ts.tz_convert(local_tz).date() if hasattr(ts, "tz_convert") else ts.date()
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(local_tz).date()
 
     for session, day_df in df.groupby("session_date"):
         fig, ax = plt.subplots(figsize=(15, 8))
@@ -1360,7 +1360,9 @@ def main():
 
     elif args.command == "analyze":
         # Load prepared data
-        if args.data.endswith(".parquet") and HAVE_PARQUET:
+        if args.data.endswith(".parquet"):
+            if not HAVE_PARQUET:
+                raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
             df = pd.read_parquet(args.data)
         else:
             df = pd.read_csv(args.data, parse_dates=["timestamp"])
@@ -1421,7 +1423,9 @@ def main():
 
         # Load data
         LOG.info(f"Loading data from {args.data}")
-        if args.data.endswith(".parquet") and HAVE_PARQUET:
+        if args.data.endswith(".parquet"):
+            if not HAVE_PARQUET:
+                raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
             df = pd.read_parquet(args.data)
         else:
             df = pd.read_csv(args.data, parse_dates=["timestamp"])
@@ -1460,17 +1464,15 @@ def main():
             n_episodes = all_stats.get("n_episodes", 0)
 
             summary_row = {"run_id": run_id, "params": json.dumps(params)}
+            summary_row["n_valid_episodes"] = n_episodes
+            summary_row["n_invalid_episodes"] = all_stats.get("n_invalid_episodes", 0)
             if n_episodes > 0:
                 summary_row.update({
-                    "n_episodes": n_episodes,
-                    "n_invalid": all_stats.get("n_invalid_episodes", 0),
                     "respect_rate": all_stats.get("outcome_rates", {}).get("RESPECT"),
                     "pierce_revert_rate": all_stats.get("outcome_rates", {}).get("PIERCE_AND_REVERT"),
                     "break_rate": all_stats.get("outcome_rates", {}).get("BREAK"),
                     "timeout_rate": all_stats.get("outcome_rates", {}).get("TIMEOUT"),
                 })
-            else:
-                summary_row.update({"n_episodes": 0, "n_invalid": all_stats.get("n_invalid_episodes", 0)})
             summary_results.append(summary_row)
 
         # Save summary
