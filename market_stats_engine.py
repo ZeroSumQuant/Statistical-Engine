@@ -1,33 +1,113 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-market_stats_engine.py v2.0
+market_stats_engine.py v3.0 (Quant-Delight Edition)
 
-Production-ready market statistical analysis engine for NQ futures that:
+A single-file, production-ready market statistical analysis engine.
 
-1. Validates data integrity and handles gaps/invalid bars
-1. Detects statistically significant support/resistance zones with significance testing
-1. Tracks episodes with refactored, testable state management
-1. Computes robust statistics with proper confidence intervals
-1. Validates all parameters and their relationships
-1. Provides comprehensive logging and error handling
+This engine discovers statistically significant support/resistance zones in
+financial market data, evaluates their performance using a robust state machine,
+and provides deep quantitative analysis on the results. It is designed to be
+instrument-agnostic, configurable, and extensible, all while maintaining the
+constraint of being a single Python file.
 
-Major improvements:
+Key Features:
+- Instrument-agnostic via YAML configuration (Futures, FX, Crypto).
+- Pluggable providers for zone discovery (pivots, external levels).
+- Walk-forward validation for robust out-of-sample testing.
+- Advanced statistical analysis: cohort analysis, survival curves, tail risk (CVaR).
+- Optional SQLite persistence for run lineage and results tracking.
+- Self-contained HTML reports with embedded plots for easy sharing.
+- Performance-aware with optional multiprocessing and progress bars.
 
-- Data validation pipeline with OHLC integrity checks
-- Refactored episode detection with clear state transitions
-- Statistical significance testing for zones
-- Block bootstrap for correlated episodes
-- Vectorized operations where possible
-- Comprehensive parameter validation
+Example Usage:
+---------------
+
+# 1. Basic in-sample analysis on prepared NQ data
+python market_stats_engine.py analyze --data cache/nq_prepared.parquet --out results/nq_run_1
+
+# 2. Instrument Swap: Run on Crude Oil (CL) using a custom config
+# --- cl_config.yml ---
+# instrument:
+#   symbol: "CL"
+#   tick_size: 0.01
+#   point_value: 1000.0
+#   session_tz: "America/New_York"
+#   rth_start: "09:00"
+#   rth_end: "14:30"
+# ---------------------
+python market_stats_engine.py analyze --data cache/cl_prepared.parquet --config cl_config.yml --out results/cl_run_1
+
+# 3. Walk-forward validation (90-day training window, 30-day testing step)
+python market_stats_engine.py analyze --data cache/es_prepared.parquet --wf "window=90d,step=30d" --out results/es_wf
+
+# 4. Generate a self-contained HTML report
+python market_stats_engine.py analyze --data cache/nq_prepared.parquet --report --out results/nq_report
+
+# 5. Save results to a database for lineage tracking
+python market_stats_engine.py analyze --data cache/nq_prepared.parquet --db my_results.db
+
+# 6. Parallel sweep using 8 cores
+python market_stats_engine.py sweep --data cache/nq_prepared.parquet --grid sweep_grid.yml --jobs 8 --out sweep_results/
+
+# 7. Run the built-in self-test to verify core functionality
+python market_stats_engine.py self-test
 """
+
+# ————————————————————————————————————————————————————————————————————————————
+# TABLE OF CONTENTS
+# ————————————————————————————————————————————————————————————————————————————
+#
+# 1. CONFIG & CONSTANTS
+#    - Global constants for data quality and statistical thresholds.
+#
+# 2. DATAMODELS
+#    - InstrumentConfig, IndicatorConfig, ZoneConfig, EpisodeConfig, etc.
+#    - Enums: EpisodeOutcome, ZoneType.
+#    - Zone: Dataclass for a detected support/resistance zone.
+#
+# 3. UTILS
+#    - Statistical helpers: test_zone_significance, block_bootstrap_ci.
+#    - General helpers: get_file_sha256, update_dataclass_from_dict.
+#
+# 4. DATA PREP
+#    - DataValidator, prepare_data, annotate_sessions, add_indicators.
+#
+# 5. ZONE PROVIDERS
+#    - Registry for pluggable zone detection logic (pivots, external levels).
+#
+# 6. EPISODES
+#    - State machine for detecting episodes (SearchingForTouch, TrackingOutcome).
+#
+# 7. STATISTICS
+#    - Core analysis loop, computation of cohort stats, survival, CVaR, etc.
+#
+# 8. PERSISTENCE
+#    - SQLite writer/reader for run lineage.
+#
+# 9. PLOTTING
+#    - Generation of PNG plots (distributions, daily maps, heatmaps).
+#
+# 10. REPORT
+#    - Single-file HTML report generation with embedded PNGs.
+#
+# 11. CLI & MAIN
+#    - Argparse setup and main execution logic.
+#
+# 12. SELF-TEST
+#    - Tiny synthetic data run to verify core functionality.
+#
+
+##############################################################################
+# IMPORTS
+##############################################################################
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Callable
 import datetime as dt
 import json
 import math
@@ -98,8 +178,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# ————————— Logging Setup —————————
+##############################################################################
+# 1. CONFIG & CONSTANTS
+##############################################################################
 
+# ————————— Logging Setup —————————
 LOG = logging.getLogger("market_stats_engine")
 handler = logging.StreamHandler(stream=sys.stdout)
 formatter = logging.Formatter("[%(asctime)s] %(levelname)s [%(funcName)s:%(lineno)d] %(message)s")
@@ -108,7 +191,6 @@ LOG.addHandler(handler)
 LOG.setLevel(logging.INFO)
 
 # ————————— Constants —————————
-
 # Data quality thresholds
 MAX_PRICE_CHANGE_PERCENT = 20.0  # Max % change between bars
 MIN_VOLUME = 1  # Minimum valid volume
@@ -119,14 +201,17 @@ MIN_EPISODES_FOR_STATS = 30  # Minimum episodes for reliable statistics
 ZONE_SIGNIFICANCE_ALPHA = 0.05  # Significance level for zone detection
 BOOTSTRAP_BLOCK_SIZE = 10  # Block size for correlated bootstrap
 
-# ————————— Enums —————————
+##############################################################################
+# 2. DATAMODELS (dataclasses & enums)
+##############################################################################
 
+# ————————— Enums —————————
 class EpisodeOutcome(Enum):
     RESPECT = "RESPECT"
     PIERCE_AND_REVERT = "PIERCE_AND_REVERT"
     BREAK = "BREAK"
     TIMEOUT = "TIMEOUT"
-    INVALID = "INVALID"  # New: for data quality issues
+    INVALID = "INVALID"  # For data quality issues
 
 class ZoneType(Enum):
     SUPPORT = "SUPPORT"
@@ -135,10 +220,16 @@ class ZoneType(Enum):
 # ————————— Config Models with Validation —————————
 
 @dataclass
-class SessionConfig:
-    tz_rth: str = "America/New_York"
+class InstrumentConfig:
+    """Instrument-specific parameters"""
+    symbol: str = "NQ"
+    tick_size: float = 0.25
+    point_value: float = 20.0     # currency per point
+    exchange: str = "CME"
+    session_tz: str = "America/New_York"
     rth_start: str = "09:30"
     rth_end: str = "16:00"
+    currency: str = "USD"
 
     def __post_init__(self):
         # Validate time format
@@ -146,7 +237,7 @@ class SessionConfig:
             pd.to_datetime(self.rth_start, format="%H:%M")
             pd.to_datetime(self.rth_end, format="%H:%M")
         except:
-            raise ValueError("Invalid time format. Use HH:MM")
+            raise ValueError("Invalid time format for RTH window. Use HH:MM")
 
 @dataclass
 class IndicatorConfig:
@@ -165,17 +256,19 @@ class IndicatorConfig:
 
 @dataclass
 class ZoneConfig:
+    providers: List[str] = field(default_factory=lambda: ["pivots"])
+    extern_levels_path: Optional[str] = None # Path to CSV for 'extern_levels' provider
     pivot_k: int = 5
     zone_width_points: Optional[float] = 15.0
     zone_width_alpha_atr: Optional[float] = None
-    cluster_width_points: Optional[float] = None  # New: for decoupling clustering from trade width
-    tick_size: float = 0.25  # Instrument-specific tick size
-    null_width_multiplier: float = 1.5 # Multiplier for significance test width
+    cluster_width_points: Optional[float] = None
+    tick_size: Optional[float] = None  # Override instrument tick_size if set
+    null_width_multiplier: float = 1.5
     expire_days: int = 30
     merge_tolerance_points: float = 2.0
-    max_cluster_span_days: Optional[int] = None # Max time span for a single cluster
+    max_cluster_span_days: Optional[int] = None
     min_touches_for_significance: int = 2
-    significance_test: bool = True  # New: enable statistical testing
+    significance_test: bool = True
 
     def __post_init__(self):
         if self.pivot_k < 1:
@@ -198,7 +291,12 @@ class EpisodeConfig:
     O: float = 6.0   # overshoot tolerance
     T: int = 20      # timeout bars
     treat_timeout_as_break: bool = False
-    max_gap_bars: int = 5  # New: max gap within episode
+    max_gap_bars: int = 5
+    first_touch_only: bool = False
+    min_bars_between_touches: int = 0
+    max_episodes_per_zone: Optional[int] = None
+    outliers_policy: str = "invalidate"  # "invalidate" | "skip"
+
 
     def __post_init__(self):
         if self.R <= 0:
@@ -209,12 +307,14 @@ class EpisodeConfig:
             raise ValueError(f"Overshoot {self.O} must be less than reversal {self.R}")
         if self.T < 1:
             raise ValueError("Timeout T must be >= 1")
-        if self.T > 390:  # Typical RTH session length
-            LOG.warning(f"Timeout {self.T} exceeds typical session length")
+        if self.T > 390:  # Typical RTH session length for NQ
+            LOG.warning(f"Timeout {self.T} may exceed typical session length")
+        if self.outliers_policy not in ["invalidate", "skip"]:
+            raise ValueError(f"outliers_policy must be 'invalidate' or 'skip', not '{self.outliers_policy}'")
 
 @dataclass
 class DataQualityConfig:
-    """New: Configuration for data validation"""
+    """Configuration for data validation"""
     check_ohlc_integrity: bool = True
     max_price_change_pct: float = MAX_PRICE_CHANGE_PERCENT
     min_volume: int = MIN_VOLUME
@@ -225,110 +325,30 @@ class DataQualityConfig:
 
 @dataclass
 class EngineConfig:
-    session: SessionConfig = field(default_factory=SessionConfig)
+    instrument: InstrumentConfig = field(default_factory=InstrumentConfig)
     indicators: IndicatorConfig = field(default_factory=IndicatorConfig)
     zones: ZoneConfig = field(default_factory=ZoneConfig)
     episode: EpisodeConfig = field(default_factory=EpisodeConfig)
     data_quality: DataQualityConfig = field(default_factory=DataQualityConfig)
     cache_dir: str = "cache"
     out_dir: str = "runs/run_latest"
+    random_seed: Optional[int] = 42
 
-# ————————— Data Validation —————————
+@dataclass
+class Zone:
+    id: int
+    type: ZoneType
+    level: float
+    width: float
+    activation_time: pd.Timestamp
+    touches: List[float]
+    p_value: float
+    is_significant: bool
+    expire_days: int = 30
 
-class DataValidator:
-    """Validates and cleans OHLCV data"""
-    def __init__(self, config: DataQualityConfig):
-        self.config = config
-
-    def validate_and_clean(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """
-        Validate OHLCV data and return cleaned dataframe with validation report
-        """
-        report = {
-            "original_rows": len(df),
-            "invalid_ohlc": 0,
-            "outliers": 0,
-            "gaps_detected": 0,
-            "low_volume": 0
-        }
-
-        if self.config.check_ohlc_integrity:
-            # OHLC relationship validation
-            invalid_mask = (
-                (df["high"] < df["low"]) |
-                (df["high"] < df["open"]) |
-                (df["high"] < df["close"]) |
-                (df["low"] > df["open"]) |
-                (df["low"] > df["close"])
-            )
-            report["invalid_ohlc"] = invalid_mask.sum()
-            if invalid_mask.any():
-                LOG.warning(f"Removing {invalid_mask.sum()} bars with invalid OHLC relationships")
-                df = df[~invalid_mask].copy()
-
-        # Price change validation
-        if self.config.max_price_change_pct > 0:
-            pct_change = df["close"].pct_change().abs() * 100
-            too_big_mask = pct_change > self.config.max_price_change_pct
-            if too_big_mask.any():
-                report["price_spike"] = int(too_big_mask.sum())
-                LOG.warning(f"Removing {report['price_spike']} bars with >{self.config.max_price_change_pct}% move")
-                df = df[~too_big_mask].copy()
-
-        # Volume validation
-        if self.config.min_volume > 0:
-            invalid_vol = df["volume"] < self.config.min_volume
-            report["low_volume"] = invalid_vol.sum()
-            if invalid_vol.any():
-                LOG.warning(f"Removing {report['low_volume']} bars with volume < {self.config.min_volume}")
-                df = df[~invalid_vol].copy()
-
-        # Outlier detection
-        df["is_outlier"] = False
-        if self.config.remove_outliers:
-            df["returns"] = df["close"].pct_change()
-
-            if "session_date" in df.columns:
-                # Compute MAD of returns per session, which is more robust to outliers
-                mad = df.groupby("session_date")["returns"].transform(lambda x: (x - x.median()).abs().median())
-                # 1.4826 scales MAD to be like STD for a normal distribution
-                # Add a small epsilon to avoid division by zero or issues with flat series
-                outlier_threshold = self.config.outlier_std_threshold * mad * 1.4826 + 1e-9
-                outliers = df["returns"].abs() > outlier_threshold
-            else:
-                # Fallback if session_date is not available
-                outlier_threshold = df["returns"].std() * self.config.outlier_std_threshold
-                outliers = df["returns"].abs() > outlier_threshold
-
-            report["outliers"] = outliers.sum()
-            if outliers.any():
-                LOG.info(f"Flagging {outliers.sum()} outlier bars")
-                df.loc[outliers, "is_outlier"] = True
-
-            # Drop the temporary returns column
-            df = df.drop(columns=["returns"])
-
-        # Gap detection
-        if self.config.handle_gaps:
-            same_session = df["session_date"] == df["session_date"].shift(1)
-            time_diff = df["timestamp"].diff()
-
-            gaps = same_session & (time_diff > pd.Timedelta(minutes=self.config.max_gap_minutes))
-            df["has_gap"] = gaps.fillna(False)
-            report["gaps_detected"] = int(gaps.sum())
-
-            if report["gaps_detected"] > 0:
-                LOG.info(f"Detected {report['gaps_detected']} intra-session gaps > {self.config.max_gap_minutes} minutes")
-        else:
-            df["has_gap"] = False
-
-        report["final_rows"] = len(df)
-        report["rows_removed"] = report["original_rows"] - report["final_rows"]
-        report["removal_pct"] = 100 * report["rows_removed"] / report["original_rows"] if report["original_rows"] > 0 else 0
-
-        return df, report
-
-# ————————— Statistical Utilities —————————
+##############################################################################
+# 3. UTILS (time, rng, validation helpers)
+##############################################################################
 
 def test_zone_significance(touches: List[float], level: float, width: float,
                            local_prices: pd.Series, alpha: float = ZONE_SIGNIFICANCE_ALPHA) -> Tuple[bool, float]:
@@ -344,830 +364,50 @@ def test_zone_significance(touches: List[float], level: float, width: float,
     if window_pts <= 0:
         return True, 1.0  # Cannot determine p0, default to significant
 
-    # Probability of a random price falling in the zone
     p0 = min(1.0, (2.0 * width) / window_pts)
-
-    # Number of observed touches inside the zone band
     x_obs = sum(1 for t in touches if abs(t - level) <= width)
 
     if HAVE_SCIPY:
-        # Use scipy for exact binomial test (survival function)
-        # sf(k, n, p) is 1 - cdf(k, n, p). We want P(X >= x_obs), which is sf(x_obs - 1).
         pval = scipy_stats.binom.sf(k=x_obs - 1, n=n, p=p0)
     else:
-        # Fallback to math.comb
         from math import comb
         try:
             pval = sum(comb(n, k) * (p0**k) * ((1-p0)**(n-k)) for k in range(x_obs, n + 1))
-        except (ValueError, TypeError): # math.comb can fail on non-integers
-            pval = 1.0 # Default to non-significant if calculation fails
+        except (ValueError, TypeError):
+            pval = 1.0
 
     return pval < alpha, pval
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None # type: ignore
+
 def block_bootstrap_ci(data: np.ndarray, statistic_func, n_boot: int = 5000,
-                       block_size: int = BOOTSTRAP_BLOCK_SIZE, alpha: float = 0.05) -> Tuple[float, float]:
-    """
-    Circular moving block bootstrap for confidence intervals.
-    This method is more robust for time series data as it preserves dependencies
-    and handles edge effects by wrapping the data in a circle.
-    """
+                       block_size: int = BOOTSTRAP_BLOCK_SIZE, alpha: float = 0.05, seed: Optional[int] = None) -> Tuple[float, float]:
+    """Circular moving block bootstrap for confidence intervals."""
     n = len(data)
     if n < block_size:
-        # Fall back to standard bootstrap for small samples
-        return standard_bootstrap_ci(data, statistic_func, n_boot, alpha)
-
-    rng = np.random.default_rng(42)
+        return standard_bootstrap_ci(data, statistic_func, n_boot, alpha, seed=seed)
+    rng = np.random.default_rng(seed)
     bootstrap_stats = []
-
-    # Extended series for circular wrapping
     extended_data = np.concatenate([data, data[:block_size - 1]])
-
     for _ in range(n_boot):
-        # Number of blocks needed to create a series of length n
         num_blocks = math.ceil(n / block_size)
-
-        # Sample random block start indices
         start_indices = rng.integers(0, n, size=num_blocks)
-
-        # Create resampled data by taking blocks and trimming to original length
         resampled_indices = np.concatenate([np.arange(s, s + block_size) for s in start_indices])[:n]
         resampled_data = extended_data[resampled_indices]
-
         bootstrap_stats.append(statistic_func(resampled_data))
-
     bootstrap_stats = np.array(bootstrap_stats)
-    ci_lower = np.percentile(bootstrap_stats, 100 * alpha / 2)
-    ci_upper = np.percentile(bootstrap_stats, 100 * (1 - alpha / 2))
-
-    return float(ci_lower), float(ci_upper)
+    return float(np.percentile(bootstrap_stats, 100 * alpha / 2)), float(np.percentile(bootstrap_stats, 100 * (1 - alpha / 2)))
 
 def standard_bootstrap_ci(data: np.ndarray, statistic_func, n_boot: int = 5000,
-                          alpha: float = 0.05) -> Tuple[float, float]:
+                          alpha: float = 0.05, seed: Optional[int] = None) -> Tuple[float, float]:
     """Standard bootstrap for comparison"""
-    rng = np.random.default_rng(42)
-    bootstrap_stats = []
-
-    for _ in range(n_boot):
-        resampled = rng.choice(data, size=len(data), replace=True)
-        bootstrap_stats.append(statistic_func(resampled))
-
+    rng = np.random.default_rng(seed)
+    bootstrap_stats = [statistic_func(rng.choice(data, size=len(data), replace=True)) for _ in range(n_boot)]
     bootstrap_stats = np.array(bootstrap_stats)
-    ci_lower = np.percentile(bootstrap_stats, 100 * alpha / 2)
-    ci_upper = np.percentile(bootstrap_stats, 100 * (1 - alpha / 2))
-
-    return float(ci_lower), float(ci_upper)
-
-# ————————— Refactored Episode Detection —————————
-
-class EpisodeState(ABC):
-    """Abstract base class for episode states"""
-    @abstractmethod
-    def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional['EpisodeState']]:
-        """Process a bar and return outcome (if terminal) and next state"""
-        pass
-
-class SearchingForTouch(EpisodeState):
-    """Initial state: searching for first touch of zone"""
-    def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional[EpisodeState]]:
-        bar = context["bar"]
-        zone = context["zone"]
-        df = context["df"]
-
-        band_low = zone["level"] - zone["width"]
-        band_high = zone["level"] + zone["width"]
-
-        # Check if bar touches zone
-        if bar["low"] <= band_high and bar["high"] >= band_low:
-            touch_idx = context["current_idx"]
-            context["touch_idx"] = touch_idx
-            context["touch_time"] = bar["timestamp"]
-
-            # Enrich context at touch
-            touch_bar = df.iloc[touch_idx]
-            context["rsi_at_touch"] = touch_bar.get("rsi")
-            context["atr_at_touch"] = touch_bar.get("atr")
-            context["rvol_at_touch"] = touch_bar.get("rvol")
-            context["stoch_k_at_touch"] = touch_bar.get("stoch_k")
-            context["stoch_d_at_touch"] = touch_bar.get("stoch_d")
-            context["is_rth_at_touch"] = touch_bar.get("is_rth")
-            context["minute_of_day_at_touch"] = touch_bar.get("minute_of_day")
-
-            # Determine approach direction
-            if context["current_idx"] > 0:
-                prev_close = context["prev_close"]
-                if prev_close > band_high:
-                    context["from_above"] = True
-                elif prev_close < band_low:
-                    context["from_above"] = False
-                else:
-                    context["from_above"] = None
-
-            return None, TrackingOutcome()
-
-        return None, self
-
-class TrackingOutcome(EpisodeState):
-    """State: tracking price after touch to determine outcome"""
-    def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional[EpisodeState]]:
-        config = context["config"]
-        # Check for stale data within an episode using timestamps
-        if config["max_gap_bars"] > 0 and "prev_ts" in context:
-            if (context["bar"]["timestamp"] - context["prev_ts"]) > (context["bar_dt"] * config["max_gap_bars"]):
-                LOG.debug("Invalidating episode due to timestamp gap")
-                return EpisodeOutcome.INVALID, None
-        context["prev_ts"] = context["bar"]["timestamp"]
-
-        bar = context["bar"]
-        zone = context["zone"]
-
-        band_low = zone["level"] - zone["width"]
-        band_high = zone["level"] + zone["width"]
-        band_break_high = band_high + config["O"]
-        band_break_low = band_low - config["O"]
-
-        # Update metrics
-        direction = -1 if zone["type"] == ZoneType.RESISTANCE else 1
-        ref = zone["level"]
-
-        if direction == -1:
-            fav = max(0.0, ref - bar["low"])
-            adv = max(0.0, bar["high"] - ref)
-        else:
-            fav = max(0.0, bar["high"] - ref)
-            adv = max(0.0, ref - bar["low"])
-
-        context["max_favorable"] = max(context.get("max_favorable", 0), fav)
-        context["max_adverse"] = max(context.get("max_adverse", 0), adv)
-
-        bars_since_touch = context["current_idx"] - context["touch_idx"]
-
-        # Check for invalidating conditions first
-        if bar.get("is_outlier", False):
-            LOG.debug(f"Invalidating episode due to outlier bar at {bar['timestamp']}")
-            return EpisodeOutcome.INVALID, None
-
-        if bar.get("has_gap", False):
-            LOG.debug(f"Invalidating episode due to data gap before {bar['timestamp']}")
-            return EpisodeOutcome.INVALID, None
-
-        # Check outcomes in priority order
-        pierced_now = (
-            (bar["high"] > band_high and bar["high"] <= band_break_high) or
-            (bar["low"] < band_low and bar["low"] >= band_break_low)
-        )
-        if pierced_now:
-            context["pierced_before"] = True
-
-        respected_now = context["max_favorable"] >= config["R"]
-
-        # 1. Break: Close beyond band by more than O
-        if bar["close"] > band_break_high or bar["close"] < band_break_low:
-            return EpisodeOutcome.BREAK, None
-
-        # 2. Pierce and Revert: Must have pierced *before* respecting
-        if context.get("pierced_before", False) and respected_now:
-            return EpisodeOutcome.PIERCE_AND_REVERT, None
-
-        # Check for favorable exit before respect
-        if not context.get("exited_favorably", False):
-            if direction == 1:  # SUPPORT: favorable is up
-                if bar["high"] > band_high:
-                    context["exited_favorably"] = True
-            else:               # RESISTANCE: favorable is down
-                if bar["low"] < band_low:
-                    context["exited_favorably"] = True
-
-        # 3. Respect: Reversed by R without breaking, after a favorable exit
-        if context.get("exited_favorably", False) and respected_now:
-            return EpisodeOutcome.RESPECT, None
-
-        # 4. Timeout
-        if bars_since_touch >= config["T"]:
-            if config.get("treat_timeout_as_break", False):
-                return EpisodeOutcome.BREAK, None
-            return EpisodeOutcome.TIMEOUT, None
-
-        return None, self
-
-class EpisodeDetector:
-    """Refactored episode detection with clear state management"""
-    def __init__(self, config: EpisodeConfig):
-        self.config = config
-
-    def detect_episode(self, df: pd.DataFrame, zone: Dict[str, Any], start_idx: int) -> Optional[Dict[str, Any]]:
-        """Detect episode for a zone starting from start_idx"""
-        state = SearchingForTouch()
-        bar_dt = df["timestamp"].diff().median()
-        if pd.isna(bar_dt) or bar_dt <= pd.Timedelta(0):
-            bar_dt = pd.Timedelta(minutes=1)
-
-        context = {
-            "df": df, # Pass full dataframe to context
-            "zone": zone,
-            "config": dataclasses.asdict(self.config),
-            "bar_dt": bar_dt,
-            "touch_idx": None,
-            "touch_time": None,
-            "from_above": None,
-            "max_favorable": 0.0,
-            "max_adverse": 0.0,
-            "pierced_before": False,
-        }
-
-        expiry_time = zone.get("expiry_time")
-
-        for i in range(start_idx, len(df)):
-            bar = df.iloc[i]
-
-            if expiry_time and bar["timestamp"] > expiry_time:
-                LOG.debug(f"Zone {zone['id']} expired during episode search. Stopping.")
-                break
-
-            context["current_idx"] = i
-            context["bar"] = bar.to_dict()
-            if i > 0:
-                context["prev_close"] = df.iloc[i-1]["close"]
-
-            outcome, next_state = state.process_bar(context)
-
-            # If state changed (e.g., from Searching to Tracking), re-process the same bar
-            if next_state is not state and next_state is not None:
-                state = next_state
-                outcome, next_state = state.process_bar(context)
-
-            if outcome is not None:
-                # Terminal state reached
-                return {
-                    "zone_id": zone["id"],
-                    "zone_type": zone["type"],
-                    "outcome": outcome,
-                    "touch_time": context["touch_time"],
-                    "outcome_time": bar["timestamp"],
-                    "bars_to_outcome": i - context["touch_idx"] if context["touch_idx"] is not None else -1,
-                    "max_favorable": context["max_favorable"],
-                    "max_adverse": context["max_adverse"],
-                    "from_above": context["from_above"],
-                    "end_idx": i,
-                    # Add enriched context at touch
-                    "rsi_at_touch": context.get("rsi_at_touch"),
-                    "atr_at_touch": context.get("atr_at_touch"),
-                    "rvol_at_touch": context.get("rvol_at_touch"),
-                    "stoch_k_at_touch": context.get("stoch_k_at_touch"),
-                    "stoch_d_at_touch": context.get("stoch_d_at_touch"),
-                    "is_rth_at_touch": context.get("is_rth_at_touch"),
-                    "minute_of_day_at_touch": context.get("minute_of_day_at_touch"),
-                    # Add enriched context at outcome
-                    "rsi_at_outcome": bar.get("rsi"),
-                    "atr_at_outcome": bar.get("atr"),
-                    "rvol_at_outcome": bar.get("rvol"),
-                    "stoch_k_at_outcome": bar.get("stoch_k"),
-                    "stoch_d_at_outcome": bar.get("stoch_d"),
-                }
-
-            if next_state is None:
-                break
-
-            state = next_state
-
-        return None
-
-# ————————— Zone Detection with Significance Testing —————————
-
-def merge_close_zones(zones: List['Zone'], tolerance: float, config: 'ZoneConfig') -> List['Zone']:
-    """Merges zones that are closer than the given tolerance."""
-    if not zones:
-        return []
-
-    # Sort zones by level to easily find adjacent ones
-    sorted_zones = sorted(zones, key=lambda z: z.level)
-
-    merged_zones = [sorted_zones[0]]
-
-    for current_zone in sorted_zones[1:]:
-        prev_zone = merged_zones[-1]
-
-        if abs(current_zone.level - prev_zone.level) <= tolerance:
-            # Merge the current zone into the previous one
-            total_touches = len(prev_zone.touches) + len(current_zone.touches)
-            if total_touches == 0: continue
-
-            # Weighted average for the new level
-            new_level = ((prev_zone.level * len(prev_zone.touches)) +
-                         (current_zone.level * len(current_zone.touches))) / total_touches
-
-            new_touches = prev_zone.touches + current_zone.touches
-            new_p_value = min(prev_zone.p_value, current_zone.p_value)
-            new_activation_time = min(prev_zone.activation_time, current_zone.activation_time)
-            new_width = (prev_zone.width + current_zone.width) / 2.0
-
-            # Update the last zone in the merged list
-            merged_zones[-1] = dataclasses.replace(
-                prev_zone,
-                level=new_level,
-                touches=new_touches,
-                p_value=new_p_value,
-                activation_time=new_activation_time,
-                width=new_width
-            )
-        else:
-            # No merge, just add the new zone
-            merged_zones.append(current_zone)
-
-    return merged_zones
-
-@dataclass
-class Zone:
-    id: int
-    type: ZoneType
-    level: float
-    width: float
-    activation_time: pd.Timestamp
-    touches: List[float]
-    p_value: float
-    is_significant: bool
-    expire_days: int = 30
-
-def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List[Zone]:
-    """Detect zones with statistical significance testing"""
-    # Detect pivots first
-    pivots = detect_pivots(df, config.pivot_k, config)
-
-    final_zones = []
-    zone_id = 1
-
-    # Group pivots by type
-    high_pivots = [p for p in pivots if p["type"] == "HIGH"]
-    low_pivots = [p for p in pivots if p["type"] == "LOW"]
-
-    for pivot_list, zone_type in [(high_pivots, ZoneType.RESISTANCE),
-                               (low_pivots, ZoneType.SUPPORT)]:
-
-        candidate_zones = []
-        clusters = cluster_pivots(pivot_list, config)
-
-        for cluster in clusters:
-            if len(cluster) < config.min_touches_for_significance:
-                continue
-
-            touches = [p["price"] for p in cluster]
-            level = np.mean(touches)
-
-            if config.zone_width_alpha_atr is not None:
-                # ... (width calculation logic is the same)
-                t0, t1 = min(p["center_time"] for p in cluster), max(p["center_time"] for p in cluster)
-                local_df = df[(df["timestamp"] >= t0) & (df["timestamp"] <= t1)]
-                atr_ref = float(local_df["atr"].median()) if not local_df.empty and not local_df["atr"].isnull().all() else float(df["atr"].median())
-                width = max(1e-9, config.zone_width_alpha_atr * atr_ref)
-            else:
-                width = config.zone_width_points or 15.0
-
-            p_value = 0.0
-            if config.significance_test:
-                min_time, max_time = min(p['center_time'] for p in cluster), max(p['center_time'] for p in cluster)
-                sessions_spanned = df[(df['timestamp'] >= min_time) & (df['timestamp'] <= max_time)]['session_date'].unique()
-                local_prices_df = df[df['session_date'].isin(sessions_spanned)]
-                if not local_prices_df.empty:
-                    width_for_test = max(width, (config.cluster_width_points or width) * config.null_width_multiplier)
-                    local_prices = pd.concat([local_prices_df['high'], local_prices_df['low']])
-                    _, p_value = test_zone_significance(touches, level, width_for_test, local_prices)
-
-            cluster_sorted_by_time = sorted(cluster, key=lambda p: p["confirm_time"])
-            activation_time = cluster_sorted_by_time[1]["confirm_time"] if len(cluster) > 1 else cluster_sorted_by_time[0]["confirm_time"]
-
-            candidate_zones.append(Zone(
-                id=0, type=zone_type, level=level, width=width,
-                activation_time=activation_time, touches=touches, p_value=p_value,
-                is_significant=False, expire_days=config.expire_days
-            ))
-
-        # Multiple testing correction
-        if config.significance_test and candidate_zones:
-            p_values = [z.p_value for z in candidate_zones]
-            if HAVE_STATSMODELS:
-                reject, _, _, _ = multipletests(p_values, alpha=ZONE_SIGNIFICANCE_ALPHA, method='fdr_bh')
-                significant_zones = [zone for zone, is_sig in zip(candidate_zones, reject) if is_sig]
-            else:
-                LOG.warning("statsmodels not found. Skipping multiple testing correction. Please `pip install statsmodels`.")
-                significant_zones = [zone for zone in candidate_zones if zone.p_value < ZONE_SIGNIFICANCE_ALPHA]
-        else:
-            significant_zones = candidate_zones
-
-        # Merge close zones of the same type
-        if config.merge_tolerance_points > 0 and significant_zones:
-            num_before_merge = len(significant_zones)
-            merged_zones = merge_close_zones(significant_zones, config.merge_tolerance_points, config)
-            LOG.info(f"Merged {num_before_merge - len(merged_zones)} {zone_type.value} zones.")
-        else:
-            merged_zones = significant_zones
-
-        # Finalize zones with correct, contiguous IDs
-        for zone in merged_zones:
-            final_zones.append(dataclasses.replace(zone, id=zone_id, is_significant=True))
-            zone_id += 1
-
-    LOG.info(f"Detected {len(final_zones)} statistically significant zones after merging.")
-    return final_zones
-
-def detect_pivots(df: pd.DataFrame, k: int, config: ZoneConfig) -> List[Dict[str, Any]]:
-    """Detect pivots with look-ahead safety and tolerance."""
-    pivots = []
-    tick = config.tick_size
-
-    hi = df["high"].values
-    lo = df["low"].values
-    ts = df["timestamp"]  # Keep as a Series to preserve Timestamp objects
-
-    for i in range(k, len(df) - k):
-        window_hi = hi[i-k:i+k+1]
-        window_lo = lo[i-k:i+k+1]
-
-        # Check for high pivot with tolerance
-        is_high_pivot = (hi[i] >= window_hi.max() - tick) and \
-                        (hi[i] > hi[i-1]) and \
-                        (hi[i] >= hi[i+1])
-        if is_high_pivot:
-            pivots.append({
-                "type": "HIGH",
-                "price": hi[i],
-                "center_time": ts.iat[i],
-                "confirm_time": ts.iat[i+k],
-                "index": i
-            })
-
-        # Check for low pivot with tolerance
-        is_low_pivot = (lo[i] <= window_lo.min() + tick) and \
-                       (lo[i] < lo[i-1]) and \
-                       (lo[i] <= lo[i+1])
-        if is_low_pivot:
-            pivots.append({
-                "type": "LOW",
-                "price": lo[i],
-                "center_time": ts.iat[i],
-                "confirm_time": ts.iat[i+k],
-                "index": i
-            })
-
-    return pivots
-
-def cluster_pivots(pivots: List[Dict], config: ZoneConfig) -> List[List[Dict]]:
-    """Cluster nearby pivots"""
-    if not pivots:
-        return []
-
-    sorted_pivots = sorted(pivots, key=lambda x: x["price"])
-    clusters = []
-    current_cluster = [sorted_pivots[0]]
-
-    for pivot in sorted_pivots[1:]:
-        # Check if pivot belongs to current cluster based on price
-        cluster_center = np.mean([p["price"] for p in current_cluster])
-        width = config.cluster_width_points or 15.0 # Use dedicated clustering width
-        price_is_close = abs(pivot["price"] - cluster_center) <= width
-
-        # Check time span if configured
-        time_is_close = True
-        if config.max_cluster_span_days is not None:
-            min_time = min(p['center_time'] for p in current_cluster)
-            if (pivot['center_time'] - min_time).days > config.max_cluster_span_days:
-                time_is_close = False
-
-        if price_is_close and time_is_close:
-            current_cluster.append(pivot)
-        else:
-            if len(current_cluster) >= config.min_touches_for_significance:
-                clusters.append(current_cluster)
-            current_cluster = [pivot]
-
-    # Don't forget last cluster
-    if len(current_cluster) >= config.min_touches_for_significance:
-        clusters.append(current_cluster)
-
-    return clusters
-
-# ————————— Main Pipeline Functions —————————
-
-def prepare_data(files: List[str], config: EngineConfig) -> pd.DataFrame:
-    """Load and prepare data with validation"""
-    validator = DataValidator(config.data_quality)
-    all_dfs = []
-    for file in files:
-        LOG.info(f"Loading {file}")
-
-        # Load file
-        if file.endswith(".parquet"):
-            if not HAVE_PARQUET:
-                raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
-            df = pd.read_parquet(file)
-        else:
-            df = pd.read_csv(file)
-
-        # Normalize columns
-        df.columns = [c.lower() for c in df.columns]
-        required = ["timestamp", "open", "high", "low", "close", "volume"]
-
-        missing = set(required) - set(df.columns)
-        if missing:
-            raise ValueError(f"Missing columns in {file}: {missing}")
-
-        # Ensure UTC timestamps and sort before any processing
-        df = _ensure_utc_timestamps(df)
-        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
-
-        # Annotate sessions first to enable session-based validation
-        df = annotate_sessions(df, config.session)
-
-        # Validate and clean data
-        df, report = validator.validate_and_clean(df)
-
-        LOG.info(f"Data quality report for {file}:")
-        LOG.info(f"  - Original rows: {report['original_rows']:,}")
-        LOG.info(f"  - Invalid OHLC: {report['invalid_ohlc']:,}")
-        LOG.info(f"  - Outliers flagged: {report['outliers']:,}")
-        LOG.info(f"  - Final rows: {report['final_rows']:,}")
-        LOG.info(f"  - Removed: {report['removal_pct']:.1f}%")
-
-        all_dfs.append(df)
-
-    # Combine all files
-    if not all_dfs:
-        return pd.DataFrame()
-
-    combined = pd.concat(all_dfs, ignore_index=True)
-    combined = combined.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-
-    # Add indicators on the full, sorted series
-    combined = add_indicators(combined, config.indicators)
-
-    return combined
-
-def annotate_sessions(df: pd.DataFrame, config: SessionConfig) -> pd.DataFrame:
-    """Add session information"""
-    # Convert to session timezone
-    if ZoneInfo:
-        tz = ZoneInfo(config.tz_rth)
-    elif pytz:
-        tz = pytz.timezone(config.tz_rth)
-    else:
-        tz = None
-        LOG.warning("No timezone library available, using UTC")
-
-    if tz:
-        df["local_time"] = df["timestamp"].dt.tz_convert(tz)
-    else:
-        df["local_time"] = df["timestamp"]
-
-    # Add session markers
-    df["session_date"] = df["local_time"].dt.date
-    df["minute_of_day"] = df["local_time"].dt.hour * 60 + df["local_time"].dt.minute
-
-    # RTH flag
-    rth_start = pd.to_datetime(config.rth_start).time()
-    rth_end = pd.to_datetime(config.rth_end).time()
-    df["is_rth"] = (
-        (df["local_time"].dt.time >= rth_start) &
-        (df["local_time"].dt.time < rth_end)
-    )
-
-    return df
-
-def add_indicators(df: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
-    """Add technical indicators"""
-    # ATR
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(span=config.atr_n, adjust=False).mean()
-
-    # RSI
-    delta = c.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(span=config.rsi_n, adjust=False).mean()
-    avg_loss = loss.ewm(span=config.rsi_n, adjust=False).mean()
-    df["rsi"] = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-12)))
-
-    # RVOL (simple implementation)
-    # A more robust implementation would use average volume per minute-of-day from a lookback window.
-    if config.rvol_lookback_sessions > 0:
-        # Approximate rolling window based on 390 RTH minutes per session
-        rolling_window = config.rvol_lookback_sessions * 390
-        df["avg_volume_lookback"] = df["volume"].rolling(window=rolling_window, min_periods=rolling_window // 10).mean()
-        df["rvol"] = df["volume"] / (df["avg_volume_lookback"] + 1e-12)
-    else:
-        df["rvol"] = np.nan
-
-    # --- Stochastic %K and %D ---
-    n = config.stoch_n
-    d = config.stoch_d
-    lowest_low = df["low"].rolling(window=n, min_periods=1).min()
-    highest_high = df["high"].rolling(window=n, min_periods=1).max()
-    denom = (highest_high - lowest_low).replace(0, np.nan)  # avoid /0
-    df["stoch_k"] = ((df["close"] - lowest_low) / denom * 100).clip(0, 100)
-    df["stoch_d"] = df["stoch_k"].rolling(window=d, min_periods=1).mean()
-
-    # Add more indicators as needed...
-    return df
-
-def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
-    """Run complete analysis pipeline"""
-    # Detect zones
-    zones = detect_zones_with_significance(df, config.zones)
-
-    # Detect episodes for each zone, allowing for multiple non-overlapping episodes
-    detector = EpisodeDetector(config.episode)
-    episodes = []
-
-    for zone in zones:
-        zone_dict = {
-            "id": zone.id,
-            "type": zone.type,
-            "level": zone.level,
-            "width": zone.width,
-            "expiry_time": zone.activation_time + pd.Timedelta(days=zone.expire_days)
-        }
-
-        # Find first potential bar after zone activation
-        potential_indices = df.index[df["timestamp"] > zone.activation_time]
-        if not potential_indices.any():
-            continue
-
-        current_scan_idx = int(potential_indices.min())
-
-        while current_scan_idx < len(df) and df.iloc[current_scan_idx]["timestamp"] <= zone_dict["expiry_time"]:
-            episode = detector.detect_episode(df, zone_dict, current_scan_idx)
-
-            if episode:
-                episodes.append(episode)
-
-                # Start searching for the next episode after the current one ends
-                # and after price has left the zone to ensure non-overlapping episodes.
-                last_episode_end_idx = episode["end_idx"]
-
-                # Find first bar *after* the episode that is *outside* the zone
-                band_low = zone_dict["level"] - zone_dict["width"]
-                band_high = zone_dict["level"] + zone_dict["width"]
-
-                next_scan_idx = -1
-
-                # Search from the bar *after* the episode ended
-                search_from_idx = last_episode_end_idx + 1
-                if search_from_idx >= len(df):
-                    break
-
-                for idx in range(search_from_idx, len(df)):
-                    bar = df.iloc[idx]
-                    if bar["timestamp"] > zone_dict["expiry_time"]:
-                        break  # Zone expired
-
-                    if bar["high"] < band_low or bar["low"] > band_high:
-                        # Price is outside the zone, we can start searching for the next touch
-                        next_scan_idx = idx
-                        break
-
-                if next_scan_idx != -1:
-                    current_scan_idx = next_scan_idx
-                else:
-                    # No re-approach found before end of data or expiry
-                    break
-            else:
-                # detect_episode returned None, meaning no more episodes can be found for this zone
-                break
-
-    LOG.info(f"Detected {len(episodes)} episodes across {len(zones)} zones")
-
-    # --- Stratified Statistics ---
-    episodes_df = pd.DataFrame(episodes)
-
-    if not episodes_df.empty:
-        # Add stratification columns
-        episodes_df['hour_at_touch'] = episodes_df['minute_of_day_at_touch'] // 60
-
-        # Use qcut for terciles, handle cases with not enough unique values
-        try:
-            episodes_df['atr_tercile'] = pd.qcut(episodes_df['atr_at_touch'].rank(method='first'), 3, labels=["low", "mid", "high"])
-        except (ValueError, TypeError):
-            episodes_df['atr_tercile'] = "n/a"
-
-        try:
-            episodes_df['rvol_tercile'] = pd.qcut(episodes_df['rvol_at_touch'].rank(method='first'), 3, labels=["low", "mid", "high"])
-        except (ValueError, TypeError):
-            episodes_df['rvol_tercile'] = "n/a"
-
-        # Stochastic buckets at touch
-        episodes_df["stoch_k_at_touch"] = pd.to_numeric(episodes_df["stoch_k_at_touch"], errors="coerce")
-        episodes_df["stoch_d_at_touch"] = pd.to_numeric(episodes_df["stoch_d_at_touch"], errors="coerce")
-        try:
-            episodes_df["stoch_tercile"] = pd.qcut(
-                episodes_df["stoch_k_at_touch"].rank(method="first"), 3, labels=["low", "mid", "high"]
-            )
-        except (ValueError, TypeError):
-            episodes_df["stoch_tercile"] = "n/a"
-
-        episodes_df["stoch_overbought_touch"] = episodes_df["stoch_k_at_touch"] >= 80
-        episodes_df["stoch_oversold_touch"]   = episodes_df["stoch_k_at_touch"] <= 20
-
-        strata = {
-            "all": episodes_df,
-            "rth": episodes_df[episodes_df["is_rth_at_touch"] == True],
-            "eth": episodes_df[episodes_df["is_rth_at_touch"] == False],
-            "stoch_ge80": episodes_df[episodes_df["stoch_overbought_touch"]],
-            "stoch_le20": episodes_df[episodes_df["stoch_oversold_touch"]],
-        }
-
-        for hour, group in episodes_df.groupby('hour_at_touch'):
-            if not pd.isna(hour):
-                strata[f"hour_{int(hour)}"] = group
-
-        for tercile, group in episodes_df.groupby('atr_tercile'):
-            strata[f"atr_{tercile}"] = group
-
-        for tercile, group in episodes_df.groupby('rvol_tercile'):
-            strata[f"rvol_{tercile}"] = group
-
-        for tercile, group in episodes_df.groupby('stoch_tercile'):
-            strata[f"stoch_{tercile}"] = group
-
-        stratified_stats = {
-            name: compute_statistics(data.to_dict('records'), config)
-            for name, data in strata.items() if not data.empty
-        }
-    else:
-        stratified_stats = {"all": compute_statistics([], config)}
-
-    return {
-        "zones": zones,
-        "episodes": episodes,
-        "statistics": stratified_stats,
-        "data_shape": df.shape
-    }
-
-def compute_statistics(episodes: List[Dict], config: EngineConfig, alpha: float = 0.05) -> Dict[str, Any]:
-    """Compute statistics with proper confidence intervals"""
-    # Separate valid from invalid episodes for cleaner statistics
-    valid_episodes = [e for e in episodes if e["outcome"] != EpisodeOutcome.INVALID]
-    n_invalid = len(episodes) - len(valid_episodes)
-    n_episodes = len(valid_episodes)
-
-    stats = {
-        "n_episodes": n_episodes,
-        "n_invalid_episodes": n_invalid,
-        "outcome_distribution": {},
-        "outcome_rates": {},
-        "outcome_rates_ci": {},
-        "bootstrapped_metrics": {}
-    }
-
-    if n_episodes == 0:
-        return stats
-
-    if n_episodes < MIN_EPISODES_FOR_STATS:
-        LOG.debug(f"Too few valid episodes ({n_episodes}) for full stats, computing basics.")
-
-    outcomes = np.array([e["outcome"].value for e in valid_episodes])
-
-    # --- Outcome rates and CIs ---
-    for outcome in EpisodeOutcome:
-        if outcome == EpisodeOutcome.INVALID:
-            continue
-
-        count = np.sum(outcomes == outcome.value)
-        stats["outcome_distribution"][outcome.value] = int(count)
-
-        rate = count / n_episodes if n_episodes > 0 else 0
-        stats["outcome_rates"][outcome.value] = rate
-
-        if HAVE_SCIPY and n_episodes > 0:
-            from scipy.stats import beta
-            k = int(count)
-            if k == 0:
-                ci_low, ci_high = 0.0, beta.ppf(1 - alpha / 2, 1, n_episodes)
-            elif k == n_episodes:
-                ci_low, ci_high = beta.ppf(alpha / 2, n_episodes, 1), 1.0
-            else:
-                ci_low = beta.ppf(alpha / 2, k, n_episodes - k + 1)
-                ci_high = beta.ppf(1 - alpha / 2, k + 1, n_episodes - k)
-            stats["outcome_rates_ci"][outcome.value] = (ci_low, ci_high)
-        else:
-            stats["outcome_rates_ci"][outcome.value] = (None, None)
-
-    # --- Bootstrap CIs for metrics ---
-    metrics_to_bootstrap = ["bars_to_outcome", "max_favorable", "max_adverse"]
-    if n_episodes >= 2:  # Need at least 2 data points for bootstrap
-        for metric_name in metrics_to_bootstrap:
-            data = np.array([e[metric_name] for e in valid_episodes if e.get(metric_name) is not None])
-            if len(data) > 1:
-                block_size = config.episode.T // 2 or 5
-                stats["bootstrapped_metrics"][metric_name] = {
-                    "mean": np.mean(data),
-                    "mean_ci": block_bootstrap_ci(data, np.mean, n_boot=1000, block_size=block_size),
-                    "median": np.median(data),
-                    "median_ci": block_bootstrap_ci(data, np.median, n_boot=1000, block_size=block_size),
-                    "p25": np.percentile(data, 25),
-                    "p75": np.percentile(data, 75)
-                }
-    return stats
-
-# ————————— CLI Interface —————————
+    return float(np.percentile(bootstrap_stats, 100 * alpha / 2)), float(np.percentile(bootstrap_stats, 100 * (1 - alpha / 2)))
 
 def get_file_sha256(filepath: str) -> str:
     """Computes SHA256 hash of a file."""
@@ -1177,411 +417,1167 @@ def get_file_sha256(filepath: str) -> str:
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
-
 def update_dataclass_from_dict(dc, d: Dict):
     """Recursively update dataclass fields from a dictionary."""
     for k, v in d.items():
-        if not hasattr(dc, k):
-            continue
-
+        if not hasattr(dc, k): continue
         field_value = getattr(dc, k)
         if dataclasses.is_dataclass(field_value) and isinstance(v, dict):
             update_dataclass_from_dict(field_value, v)
         else:
             setattr(dc, k, v)
 
-def load_engine_config(path: Optional[str]) -> EngineConfig:
-    """Loads engine config from YAML/JSON, overriding defaults."""
-    cfg = EngineConfig()
-    if not path or not os.path.exists(path):
-        if path:
-            LOG.warning(f"Config file not found at {path}, using defaults.")
-        return cfg
-
-    LOG.info(f"Loading config from {path}")
-    with open(path, "r") as f:
-        if path.lower().endswith((".yml", ".yaml")):
-            if not HAVE_YAML:
-                raise ImportError("pyyaml is required to load YAML configs. Please `pip install pyyaml`")
-            raw = yaml.safe_load(f)
-        else:
-            raw = json.load(f)
-
-    update_dataclass_from_dict(cfg, raw)
-    return cfg
-
-
-def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str):
-    """Generates and saves distribution plots for key episode metrics."""
-    if episodes_df.empty:
-        LOG.info("No episodes found, skipping distribution plots.")
-        return
-
-    LOG.info(f"Generating distribution plots in {out_dir}...")
-
-    # Plot 1: Outcome Distribution
-    plt.figure(figsize=(10, 6))
-    episodes_df["outcome"].value_counts().plot(kind='bar')
-    plt.title("Episode Outcome Distribution")
-    plt.ylabel("Count")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "dist_outcomes.png"))
-    plt.close()
-
-    # Plot 2: Bars to Outcome
-    plt.figure(figsize=(10, 6))
-    episodes_df["bars_to_outcome"].hist(bins=50, range=(0, episodes_df["bars_to_outcome"].quantile(0.99)))
-    plt.title("Distribution of Bars to Outcome")
-    plt.xlabel("Number of Bars")
-    plt.ylabel("Frequency")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "dist_bars_to_outcome.png"))
-    plt.close()
-
-    # Plot 3: Max Favorable/Adverse Excursion
-    plt.figure(figsize=(12, 6))
-    plt.subplot(1, 2, 1)
-    episodes_df["max_favorable"].hist(bins=50, color='g', range=(0, episodes_df["max_favorable"].quantile(0.99)))
-    plt.title("Max Favorable Excursion")
-    plt.xlabel("Points")
-    plt.subplot(1, 2, 2)
-    episodes_df["max_adverse"].hist(bins=50, color='r', range=(0, episodes_df["max_adverse"].quantile(0.99)))
-    plt.title("Max Adverse Excursion")
-    plt.xlabel("Points")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "dist_excursions.png"))
-    plt.close()
-
-    LOG.info("Distribution plots saved.")
-
-def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], out_dir: str):
-    """Generates and saves daily price charts with zones and episodes."""
-    if df.empty or not zones:
-        LOG.info("Not enough data to generate daily maps.")
-        return
-
-    maps_dir = os.path.join(out_dir, "daily_maps")
-    Path(maps_dir).mkdir(parents=True, exist_ok=True)
-    LOG.info(f"Generating daily maps in {maps_dir}...")
-
-    episodes_df = pd.DataFrame(episodes)
-    if not episodes_df.empty:
-        episodes_df["touch_time"] = pd.to_datetime(episodes_df["touch_time"])
-        episodes_df["outcome_time"] = pd.to_datetime(episodes_df["outcome_time"])
-
-    local_tz = df["local_time"].dt.tz
-    if local_tz is None:
-        LOG.warning("local_time has no tz; assuming UTC for plotting.")
-        local_tz = "UTC"
-
-    def to_local_date(ts):
-        ts = pd.Timestamp(ts)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        return ts.tz_convert(local_tz).date()
-
-    for session, day_df in df.groupby("session_date"):
-        fig, ax = plt.subplots(figsize=(15, 8))
-
-        # Plot price
-        ax.plot(day_df["timestamp"], day_df["close"], label="Close", color='black', linewidth=0.5)
-
-        # Plot active zones
-        for zone in zones:
-            zone_act_local = to_local_date(zone.activation_time)
-            zone_exp_local = to_local_date(zone.activation_time + pd.Timedelta(days=zone.expire_days))
-            if zone_act_local <= session <= zone_exp_local:
-                color = 'green' if zone.type == ZoneType.SUPPORT else 'red'
-                ax.axhspan(zone.level - zone.width, zone.level + zone.width, alpha=0.1, color=color)
-                ax.axhline(zone.level, color=color, linestyle='--', linewidth=0.7)
-
-        # Plot episodes
-        if not episodes_df.empty:
-            day_episodes = episodes_df[episodes_df["touch_time"].dt.date == session]
-            for _, episode in day_episodes.iterrows():
-                outcome = episode['outcome']
-                label = outcome.value if hasattr(outcome, "value") else str(outcome)
-                outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(label, 'grey')
-
-                # Use nearest-bar lookup for robust plotting
-                ix = df['timestamp'].searchsorted(episode['touch_time'])
-                ix = int(np.clip(ix, 1, len(df)-1))
-                cand = df.iloc[[ix-1, ix]]
-                row = cand.iloc[(cand["timestamp"] - episode['touch_time']).abs().values.argmin()]
-                touch_price = row["close"]
-                ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
-                ax.text(episode['outcome_time'], touch_price, label, color=outcome_color)
-
-        ax.set_title(f"Market Map for {session.strftime('%Y-%m-%d')}")
-        ax.set_ylabel("Price")
-        ax.grid(True, linestyle='--', alpha=0.5)
-        fig.autofmt_xdate()
-        plt.tight_layout()
-        plt.savefig(os.path.join(maps_dir, f"map_{session.strftime('%Y-%m-%d')}.png"))
-        plt.close(fig)
-    LOG.info("Daily maps saved.")
-
-
 def _ensure_utc_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     """Ensures the timestamp column is a timezone-aware UTC timestamp."""
     if "timestamp" not in df.columns:
         raise ValueError("DataFrame must have a 'timestamp' column.")
-
     if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
         df['timestamp'] = pd.to_datetime(df['timestamp'])
-
     if df['timestamp'].dt.tz is None:
         LOG.info("Timestamp column is timezone-naive, localizing to UTC.")
         df['timestamp'] = df['timestamp'].dt.tz_localize("UTC")
     else:
         df['timestamp'] = df['timestamp'].dt.tz_convert("UTC")
+    return df
 
+##############################################################################
+# 4. DATA PREP (load, sessions, indicators, validator)
+##############################################################################
+
+class DataValidator:
+    """Validates and cleans OHLCV data"""
+    def __init__(self, config: DataQualityConfig):
+        self.config = config
+
+    def validate_and_clean(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Validate OHLCV data and return cleaned dataframe with validation report"""
+        report = {"original_rows": len(df), "invalid_ohlc": 0, "outliers": 0, "gaps_detected": 0, "low_volume": 0}
+
+        if self.config.check_ohlc_integrity:
+            invalid_mask = (df["high"] < df["low"]) | (df["high"] < df["open"]) | (df["high"] < df["close"]) | (df["low"] > df["open"]) | (df["low"] > df["close"])
+            report["invalid_ohlc"] = invalid_mask.sum()
+            if invalid_mask.any():
+                LOG.warning(f"Removing {invalid_mask.sum()} bars with invalid OHLC relationships")
+                df = df[~invalid_mask].copy()
+
+        if self.config.max_price_change_pct > 0:
+            pct_change = df["close"].pct_change().abs() * 100
+            too_big_mask = pct_change > self.config.max_price_change_pct
+            if too_big_mask.any():
+                report["price_spike"] = int(too_big_mask.sum())
+                LOG.warning(f"Removing {report['price_spike']} bars with >{self.config.max_price_change_pct}% move")
+                df = df[~too_big_mask].copy()
+
+        if self.config.min_volume > 0:
+            invalid_vol = df["volume"] < self.config.min_volume
+            report["low_volume"] = invalid_vol.sum()
+            if invalid_vol.any():
+                LOG.warning(f"Removing {report['low_volume']} bars with volume < {self.config.min_volume}")
+                df = df[~invalid_vol].copy()
+
+        df["is_outlier"] = False
+        if self.config.remove_outliers:
+            df["returns"] = df["close"].pct_change()
+            if "session_date" in df.columns:
+                mad = df.groupby("session_date")["returns"].transform(lambda x: (x - x.median()).abs().median())
+                outlier_threshold = self.config.outlier_std_threshold * mad * 1.4826 + 1e-9
+                outliers = df["returns"].abs() > outlier_threshold
+            else:
+                outlier_threshold = df["returns"].std() * self.config.outlier_std_threshold
+                outliers = df["returns"].abs() > outlier_threshold
+            report["outliers"] = outliers.sum()
+            if outliers.any():
+                LOG.info(f"Flagging {outliers.sum()} outlier bars")
+                df.loc[outliers, "is_outlier"] = True
+            df = df.drop(columns=["returns"])
+
+        if self.config.handle_gaps:
+            same_session = df["session_date"] == df["session_date"].shift(1)
+            time_diff = df["timestamp"].diff()
+            gaps = same_session & (time_diff > pd.Timedelta(minutes=self.config.max_gap_minutes))
+            df["has_gap"] = gaps.fillna(False)
+            report["gaps_detected"] = int(gaps.sum())
+            if report["gaps_detected"] > 0:
+                LOG.info(f"Detected {report['gaps_detected']} intra-session gaps > {self.config.max_gap_minutes} minutes")
+        else:
+            df["has_gap"] = False
+
+        report["final_rows"] = len(df)
+        report["rows_removed"] = report["original_rows"] - report["final_rows"]
+        report["removal_pct"] = 100 * report["rows_removed"] / report["original_rows"] if report["original_rows"] > 0 else 0
+        return df, report
+
+def prepare_data(files: List[str], config: EngineConfig) -> pd.DataFrame:
+    """Load and prepare data with validation"""
+    validator = DataValidator(config.data_quality)
+    all_dfs = []
+    for file in files:
+        LOG.info(f"Loading {file}")
+        if file.endswith(".parquet"):
+            if not HAVE_PARQUET: raise ImportError("pyarrow is required. `pip install pyarrow`")
+            df = pd.read_parquet(file)
+        else:
+            df = pd.read_csv(file)
+
+        df.columns = [c.lower() for c in df.columns]
+        required = ["timestamp", "open", "high", "low", "close", "volume"]
+        if set(required) - set(df.columns):
+            raise ValueError(f"Missing columns in {file}: {set(required) - set(df.columns)}")
+
+        df = _ensure_utc_timestamps(df)
+        df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+        df = annotate_sessions(df, config.instrument)
+        df, report = validator.validate_and_clean(df)
+        LOG.info(f"Data quality report for {file}: {report}")
+        all_dfs.append(df)
+
+    if not all_dfs: return pd.DataFrame()
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined = combined.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+    combined = add_indicators(combined, config.indicators)
+    return combined
+
+def annotate_sessions(df: pd.DataFrame, config: InstrumentConfig) -> pd.DataFrame:
+    """Add session information based on instrument config"""
+    if ZoneInfo: tz = ZoneInfo(config.session_tz)
+    elif pytz: tz = pytz.timezone(config.session_tz)
+    else: tz = None; LOG.warning("No timezone library available, using UTC")
+
+    df["local_time"] = df["timestamp"].dt.tz_convert(tz) if tz else df["timestamp"]
+    df["session_date"] = df["local_time"].dt.date
+    df["minute_of_day"] = df["local_time"].dt.hour * 60 + df["local_time"].dt.minute
+    rth_start = pd.to_datetime(config.rth_start).time()
+    rth_end = pd.to_datetime(config.rth_end).time()
+    df["is_rth"] = (df["local_time"].dt.time >= rth_start) & (df["local_time"].dt.time < rth_end)
+    return df
+
+def add_indicators(df: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
+    """Add technical indicators"""
+    h, l, c = df["high"], df["low"], df["close"]
+    tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(span=config.atr_n, adjust=False).mean()
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(span=config.rsi_n, adjust=False).mean()
+    loss = -delta.clip(upper=0).ewm(span=config.rsi_n, adjust=False).mean()
+    df["rsi"] = 100 - (100 / (1 + gain / (loss + 1e-12)))
+    if config.rvol_lookback_sessions > 0:
+        rolling_window = config.rvol_lookback_sessions * 390
+        df["avg_volume_lookback"] = df["volume"].rolling(window=rolling_window, min_periods=rolling_window // 10).mean()
+        df["rvol"] = df["volume"] / (df["avg_volume_lookback"] + 1e-12)
+    else:
+        df["rvol"] = np.nan
+    n, d = config.stoch_n, config.stoch_d
+    lowest_low = df["low"].rolling(window=n, min_periods=1).min()
+    highest_high = df["high"].rolling(window=n, min_periods=1).max()
+    denom = (highest_high - lowest_low).replace(0, np.nan)
+    df["stoch_k"] = ((df["close"] - lowest_low) / denom * 100).clip(0, 100)
+    df["stoch_d"] = df["stoch_k"].rolling(window=d, min_periods=1).mean()
     return df
 
 def ensure_prepared(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
     """Checks if data has been prepared, and if not, runs preparation steps."""
-    df = _ensure_utc_timestamps(df) # Make this utility self-contained and robust
-    need_sessions = any(c not in df.columns for c in ["session_date","minute_of_day","is_rth","local_time"])
-    if need_sessions:
-        LOG.info("Input data is missing session columns, running annotate_sessions...")
-        df = annotate_sessions(df, config.session)
-
-    need_ind = any(c not in df.columns for c in ["atr", "rsi", "rvol", "stoch_k", "stoch_d"])
-    if need_ind:
-        LOG.info("Input data is missing indicator columns, running add_indicators...")
+    df = _ensure_utc_timestamps(df)
+    if any(c not in df.columns for c in ["session_date","minute_of_day","is_rth","local_time"]):
+        LOG.info("Input data missing session columns, running annotate_sessions...")
+        df = annotate_sessions(df, config.instrument)
+    if any(c not in df.columns for c in ["atr", "rsi", "rvol", "stoch_k", "stoch_d"]):
+        LOG.info("Input data missing indicator columns, running add_indicators...")
         df = add_indicators(df, config.indicators)
-
     return df
+
+##############################################################################
+# 5. ZONE PROVIDERS (registry: pivots, extern_levels)
+##############################################################################
+
+# Provider registry
+ZONE_PROVIDERS: Dict[str, Callable[[pd.DataFrame, ZoneConfig, InstrumentConfig], List[Zone]]] = {}
+
+def register_zone_provider(name: str) -> Callable:
+    """Decorator to register a new zone provider."""
+    def decorator(func: Callable[[pd.DataFrame, ZoneConfig, InstrumentConfig], List[Zone]]):
+        ZONE_PROVIDERS[name] = func
+        return func
+    return decorator
+
+def merge_close_zones(zones: List['Zone'], tolerance: float) -> List['Zone']:
+    """Merges zones that are closer than the given tolerance."""
+    if not zones: return []
+    sorted_zones = sorted(zones, key=lambda z: z.level)
+    merged_zones = [sorted_zones[0]]
+    for current_zone in sorted_zones[1:]:
+        prev_zone = merged_zones[-1]
+        if abs(current_zone.level - prev_zone.level) <= tolerance:
+            total_touches = len(prev_zone.touches) + len(current_zone.touches)
+            if total_touches == 0: continue
+            new_level = ((prev_zone.level * len(prev_zone.touches)) + (current_zone.level * len(current_zone.touches))) / total_touches
+            merged_zones[-1] = dataclasses.replace(prev_zone, level=new_level, touches=prev_zone.touches + current_zone.touches, p_value=min(prev_zone.p_value, current_zone.p_value), activation_time=min(prev_zone.activation_time, current_zone.activation_time), width=(prev_zone.width + current_zone.width) / 2.0)
+        else:
+            merged_zones.append(current_zone)
+    return merged_zones
+
+@register_zone_provider("pivots")
+def detect_zones_from_pivots(df: pd.DataFrame, config: ZoneConfig, instrument: InstrumentConfig) -> List[Zone]:
+    """Detects candidate zones from price pivots."""
+    pivots = detect_pivots(df, config.pivot_k, config, instrument)
+    candidate_zones = []
+
+    for pivot_list, zone_type in [(p for p in pivots if p["type"] == "HIGH"), ZoneType.RESISTANCE], [(p for p in pivots if p["type"] == "LOW"), ZoneType.SUPPORT]:
+        clusters = cluster_pivots(list(pivot_list), config)
+        for cluster in clusters:
+            if len(cluster) < config.min_touches_for_significance: continue
+            touches = [p["price"] for p in cluster]
+            level = np.mean(touches)
+
+            if config.zone_width_alpha_atr is not None:
+                t0, t1 = min(p["center_time"] for p in cluster), max(p["center_time"] for p in cluster)
+                local_df = df[(df["timestamp"] >= t0) & (df["timestamp"] <= t1)]
+                atr_ref = float(local_df["atr"].median() if not local_df.empty and not local_df["atr"].isnull().all() else float(df["atr"].median()))
+                width = max(1e-9, config.zone_width_alpha_atr * atr_ref)
+            else:
+                width = config.zone_width_points or 15.0
+
+            p_value = 1.0
+            if config.significance_test:
+                min_time, max_time = min(p['center_time'] for p in cluster), max(p['center_time'] for p in cluster)
+                sessions_spanned = df[(df['timestamp'] >= min_time) & (df['timestamp'] <= max_time)]['session_date'].unique()
+                local_prices_df = df[df['session_date'].isin(sessions_spanned)]
+                if not local_prices_df.empty:
+                    width_for_test = max(width, (config.cluster_width_points or width) * config.null_width_multiplier)
+                    _, p_value = test_zone_significance(touches, level, width_for_test, pd.concat([local_prices_df['high'], local_prices_df['low']]))
+
+            activation_time = sorted(cluster, key=lambda p: p["confirm_time"])[1]["confirm_time"] if len(cluster) > 1 else sorted(cluster, key=lambda p: p["confirm_time"])[0]["confirm_time"]
+
+            candidate_zones.append(Zone(
+                id=0, type=zone_type, level=level, width=width,
+                activation_time=activation_time, touches=touches, p_value=p_value,
+                is_significant=False,
+                expire_days=config.expire_days
+            ))
+
+    return candidate_zones
+
+@register_zone_provider("extern_levels")
+def detect_zones_from_csv(df: pd.DataFrame, config: ZoneConfig, instrument: InstrumentConfig) -> List[Zone]:
+    """Detects candidate zones from an external CSV file."""
+    path = config.extern_levels_path
+    if not path or not os.path.exists(path):
+        if path: LOG.warning(f"External levels CSV not found at {path}")
+        return []
+
+    LOG.info(f"Loading external levels from {path}")
+    try:
+        levels_df = pd.read_csv(path, parse_dates=['timestamp'])
+        levels_df.columns = [c.lower() for c in levels_df.columns]
+        required = ['timestamp', 'level', 'type', 'width']
+        if any(c not in levels_df.columns for c in required):
+            raise ValueError(f"External levels CSV must contain columns: {required}")
+    except Exception as e:
+        LOG.error(f"Failed to load external levels CSV: {e}")
+        return []
+
+    candidate_zones = []
+    for _, row in levels_df.iterrows():
+        level, width = row['level'], row['width']
+        zone_type = ZoneType.SUPPORT if 'supp' in row['type'].lower() else ZoneType.RESISTANCE
+        activation_time = pd.Timestamp(row['timestamp'], tz='UTC')
+
+        touch_df = df[df['timestamp'] >= activation_time]
+        touches = []
+        if zone_type == ZoneType.SUPPORT:
+            touches.extend(touch_df['low'][(touch_df['low'] >= level - width) & (touch_df['low'] <= level + width)].tolist())
+        else:
+            touches.extend(touch_df['high'][(touch_df['high'] >= level - width) & (touch_df['high'] <= level + width)].tolist())
+
+        if len(touches) < config.min_touches_for_significance:
+            continue
+
+        p_value = 1.0
+        if config.significance_test:
+            sessions_spanned = touch_df['session_date'].unique()
+            local_prices_df = df[df['session_date'].isin(sessions_spanned)]
+            if not local_prices_df.empty:
+                width_for_test = max(width, (config.cluster_width_points or width) * config.null_width_multiplier)
+                _, p_value = test_zone_significance(touches, level, width_for_test, pd.concat([local_prices_df['high'], local_prices_df['low']]))
+
+        candidate_zones.append(Zone(
+            id=0, type=zone_type, level=level, width=width,
+            activation_time=activation_time, touches=touches, p_value=p_value,
+            is_significant=False, expire_days=config.expire_days
+        ))
+
+    return candidate_zones
+
+def detect_pivots(df: pd.DataFrame, k: int, config: ZoneConfig, instrument: InstrumentConfig) -> List[Dict[str, Any]]:
+    """Detect pivots with look-ahead safety and tolerance."""
+    pivots, tick = [], config.tick_size if config.tick_size is not None else instrument.tick_size
+    hi, lo, ts = df["high"].values, df["low"].values, df["timestamp"]
+    for i in range(k, len(df) - k):
+        window_hi, window_lo = hi[i-k:i+k+1], lo[i-k:i+k+1]
+        if (hi[i] >= window_hi.max() - tick) and (hi[i] > hi[i-1]) and (hi[i] >= hi[i+1]):
+            pivots.append({"type": "HIGH", "price": hi[i], "center_time": ts.iat[i], "confirm_time": ts.iat[i+k], "index": i})
+        if (lo[i] <= window_lo.min() + tick) and (lo[i] < lo[i-1]) and (lo[i] <= lo[i+1]):
+            pivots.append({"type": "LOW", "price": lo[i], "center_time": ts.iat[i], "confirm_time": ts.iat[i+k], "index": i})
+    return pivots
+
+def cluster_pivots(pivots: List[Dict], config: ZoneConfig) -> List[List[Dict]]:
+    """Cluster nearby pivots"""
+    if not pivots: return []
+    sorted_pivots = sorted(pivots, key=lambda x: x["price"])
+    clusters, current_cluster = [], [sorted_pivots[0]]
+    for pivot in sorted_pivots[1:]:
+        price_is_close = abs(pivot["price"] - np.mean([p["price"] for p in current_cluster])) <= (config.cluster_width_points or 15.0)
+        time_is_close = config.max_cluster_span_days is None or (pivot['center_time'] - min(p['center_time'] for p in current_cluster)).days <= config.max_cluster_span_days
+        if price_is_close and time_is_close:
+            current_cluster.append(pivot)
+        else:
+            if len(current_cluster) >= config.min_touches_for_significance: clusters.append(current_cluster)
+            current_cluster = [pivot]
+    if len(current_cluster) >= config.min_touches_for_significance: clusters.append(current_cluster)
+    return clusters
+
+##############################################################################
+# 6. EPISODES (FSM & policies)
+##############################################################################
+
+class EpisodeState(ABC):
+    @abstractmethod
+    def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional['EpisodeState']]: pass
+
+class SearchingForTouch(EpisodeState):
+    def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional[EpisodeState]]:
+        bar, zone = context["bar"], context["zone"]
+        band_low, band_high = zone["level"] - zone["width"], zone["level"] + zone["width"]
+        if bar["low"] <= band_high and bar["high"] >= band_low:
+            context["touch_idx"] = context["current_idx"]
+            context["touch_time"] = bar["timestamp"]
+            touch_bar = context["df"].iloc[context["touch_idx"]]
+            for ind in ["rsi", "atr", "rvol", "stoch_k", "stoch_d", "is_rth", "minute_of_day"]: context[f"{ind}_at_touch"] = touch_bar.get(ind)
+            if context["current_idx"] > 0:
+                prev_close = context["prev_close"]
+                if prev_close > band_high: context["from_above"] = True
+                elif prev_close < band_low: context["from_above"] = False
+                else: context["from_above"] = None
+            return None, TrackingOutcome()
+        return None, self
+
+class TrackingOutcome(EpisodeState):
+    def process_bar(self, context: Dict[str, Any]) -> Tuple[Optional[EpisodeOutcome], Optional[EpisodeState]]:
+        config = context["config"]
+        bar = context["bar"]
+
+        # Handle outliers first based on policy
+        if bar.get("is_outlier", False):
+            if config.get("outliers_policy") == "skip":
+                LOG.debug(f"Skipping outlier bar at {bar['timestamp']}")
+                return None, self  # Remain in this state, effectively ignoring the bar
+            else:  # Default policy is "invalidate"
+                LOG.debug(f"Invalidating episode due to outlier bar at {bar['timestamp']}")
+                return EpisodeOutcome.INVALID, None
+
+        if config["max_gap_bars"] > 0 and "prev_ts" in context and (context["bar"]["timestamp"] - context["prev_ts"]) > (context["bar_dt"] * config["max_gap_bars"]):
+            return EpisodeOutcome.INVALID, None
+        context["prev_ts"] = context["bar"]["timestamp"]
+
+        zone = context["zone"]
+        band_low, band_high = zone["level"] - zone["width"], zone["level"] + zone["width"]
+        band_break_high, band_break_low = band_high + config["O"], band_low - config["O"]
+        direction, ref = (-1 if zone["type"] == ZoneType.RESISTANCE else 1), zone["level"]
+        fav = max(0.0, ref - bar["low"]) if direction == -1 else max(0.0, bar["high"] - ref)
+        adv = max(0.0, bar["high"] - ref) if direction == -1 else max(0.0, ref - bar["low"])
+        context["max_favorable"], context["max_adverse"] = max(context.get("max_favorable", 0), fav), max(context.get("max_adverse", 0), adv)
+
+        if bar.get("has_gap", False): return EpisodeOutcome.INVALID, None # Gap check after outlier policy
+
+        if (bar["high"] > band_high and bar["high"] <= band_break_high) or (bar["low"] < band_low and bar["low"] >= band_break_low): context["pierced_before"] = True
+        if bar["close"] > band_break_high or bar["close"] < band_break_low: return EpisodeOutcome.BREAK, None
+        if context.get("pierced_before", False) and context["max_favorable"] >= config["R"]: return EpisodeOutcome.PIERCE_AND_REVERT, None
+        if not context.get("exited_favorably", False):
+            if (direction == 1 and bar["high"] > band_high) or (direction == -1 and bar["low"] < band_low): context["exited_favorably"] = True
+        if context.get("exited_favorably", False) and context["max_favorable"] >= config["R"]: return EpisodeOutcome.RESPECT, None
+        if (context["current_idx"] - context["touch_idx"]) >= config["T"]: return EpisodeOutcome.BREAK if config.get("treat_timeout_as_break", False) else EpisodeOutcome.TIMEOUT, None
+        return None, self
+
+class EpisodeDetector:
+    def __init__(self, config: EpisodeConfig): self.config = config
+    def detect_episode(self, df: pd.DataFrame, zone: Dict[str, Any], start_idx: int) -> Optional[Dict[str, Any]]:
+        state, bar_dt = SearchingForTouch(), df["timestamp"].diff().median()
+        if pd.isna(bar_dt) or bar_dt <= pd.Timedelta(0): bar_dt = pd.Timedelta(minutes=1)
+        context = {"df": df, "zone": zone, "config": dataclasses.asdict(self.config), "bar_dt": bar_dt, "touch_idx": None, "touch_time": None, "from_above": None, "max_favorable": 0.0, "max_adverse": 0.0, "pierced_before": False}
+        expiry_time = zone.get("expiry_time")
+        for i in range(start_idx, len(df)):
+            bar = df.iloc[i]
+            if expiry_time and bar["timestamp"] > expiry_time: break
+            context.update({"current_idx": i, "bar": bar.to_dict(), "prev_close": df.iloc[i-1]["close"] if i > 0 else None})
+            outcome, next_state = state.process_bar(context)
+            if next_state is not state and next_state is not None:
+                state = next_state; outcome, next_state = state.process_bar(context)
+            if outcome is not None:
+                episode_data = {"zone_id": zone["id"], "zone_type": zone["type"], "outcome": outcome, "touch_time": context["touch_time"], "outcome_time": bar["timestamp"], "bars_to_outcome": i - context["touch_idx"] if context["touch_idx"] is not None else -1, "max_favorable": context["max_favorable"], "max_adverse": context["max_adverse"], "from_above": context["from_above"], "end_idx": i}
+                for ind in ["rsi", "atr", "rvol", "stoch_k", "stoch_d", "is_rth", "minute_of_day"]: episode_data[f"{ind}_at_touch"] = context.get(f"{ind}_at_touch")
+                for ind in ["rsi", "atr", "rvol", "stoch_k", "stoch_d"]: episode_data[f"{ind}_at_outcome"] = bar.get(ind)
+                return episode_data
+            if next_state is None: break
+            state = next_state
+        return None
+
+##############################################################################
+# 7. STATISTICS (rates, CIs, survival, tails, calibration)
+##############################################################################
+
+def discover_zones(df: pd.DataFrame, config: EngineConfig) -> List[Zone]:
+    """Runs all zone discovery providers and returns a final list of merged zones."""
+    all_candidate_zones = []
+    for provider_name in config.zones.providers:
+        if provider_name not in ZONE_PROVIDERS:
+            LOG.warning(f"Zone provider '{provider_name}' not found. Skipping.")
+            continue
+        LOG.info(f"Running zone provider: '{provider_name}'")
+        provider_func = ZONE_PROVIDERS[provider_name]
+        try:
+            zones_from_provider = provider_func(df, config.zones, config.instrument)
+            all_candidate_zones.extend(zones_from_provider)
+            LOG.info(f"Provider '{provider_name}' found {len(zones_from_provider)} candidate zones.")
+        except Exception as e:
+            LOG.error(f"Error in zone provider '{provider_name}': {e}", exc_info=True)
+
+    significant_zones = []
+    if config.zones.significance_test and all_candidate_zones:
+        p_values = [z.p_value for z in all_candidate_zones]
+        if HAVE_STATSMODELS:
+            reject, _, _, _ = multipletests(p_values, alpha=ZONE_SIGNIFICANCE_ALPHA, method='fdr_bh')
+            significant_zones = [zone for zone, is_sig in zip(all_candidate_zones, reject) if is_sig]
+        else:
+            LOG.warning("statsmodels not found. Falling back to simple p-value threshold.")
+            significant_zones = [zone for zone in all_candidate_zones if zone.p_value < ZONE_SIGNIFICANCE_ALPHA]
+    else:
+        significant_zones = all_candidate_zones
+    LOG.info(f"Found {len(significant_zones)} significant zones from {len(all_candidate_zones)} candidates before merging.")
+
+    if config.zones.merge_tolerance_points > 0 and significant_zones:
+        support_zones = [z for z in significant_zones if z.type == ZoneType.SUPPORT]
+        resistance_zones = [z for z in significant_zones if z.type == ZoneType.RESISTANCE]
+        merged_support = merge_close_zones(support_zones, config.zones.merge_tolerance_points)
+        merged_resistance = merge_close_zones(resistance_zones, config.zones.merge_tolerance_points)
+        zones = sorted(merged_support + merged_resistance, key=lambda z: z.activation_time)
+    else:
+        zones = sorted(significant_zones, key=lambda z: z.activation_time)
+
+    final_zones = [dataclasses.replace(zone, id=i+1, is_significant=True) for i, zone in enumerate(zones)]
+    LOG.info(f"Detected {len(final_zones)} final zones.")
+    return final_zones
+
+def evaluate_episodes(df: pd.DataFrame, zones: List[Zone], config: EngineConfig) -> List[Dict]:
+    """Evaluates all episodes for a given set of zones on a dataframe."""
+    detector, episodes = EpisodeDetector(config.episode), []
+    for zone in zones:
+        zone_dict = {"id": zone.id, "type": zone.type, "level": zone.level, "width": zone.width, "expiry_time": zone.activation_time + pd.Timedelta(days=zone.expire_days)}
+        zone_episodes, touch_number = [], 0
+        potential_indices = df.index[df["timestamp"] > zone.activation_time]
+        if not potential_indices.any(): continue
+        current_scan_idx = int(potential_indices.min())
+
+        while current_scan_idx < len(df) and df.iloc[current_scan_idx]["timestamp"] <= zone_dict["expiry_time"]:
+            if config.episode.max_episodes_per_zone is not None and len(zone_episodes) >= config.episode.max_episodes_per_zone: break
+            if config.episode.first_touch_only and len(zone_episodes) > 0: break
+            episode = detector.detect_episode(df, zone_dict, current_scan_idx)
+            if episode:
+                touch_number += 1
+                episode['touch_number'] = touch_number
+                zone_episodes.append(episode)
+                next_scan_idx_candidate = episode["end_idx"] + 1 + config.episode.min_bars_between_touches
+                band_low, band_high = zone_dict["level"] - zone_dict["width"], zone_dict["level"] + zone_dict["width"]
+                next_scan_idx = -1
+                if next_scan_idx_candidate >= len(df): break
+                for idx in range(next_scan_idx_candidate, len(df)):
+                    bar = df.iloc[idx]
+                    if bar["timestamp"] > zone_dict["expiry_time"]: break
+                    if bar["high"] < band_low or bar["low"] > band_high:
+                        next_scan_idx = idx; break
+                if next_scan_idx != -1: current_scan_idx = next_scan_idx
+                else: break
+            else: break
+        episodes.extend(zone_episodes)
+    return episodes
+
+def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
+    """Run complete in-sample analysis pipeline"""
+    zones = discover_zones(df, config)
+    episodes = evaluate_episodes(df, zones, config)
+    LOG.info(f"Detected {len(episodes)} episodes across {len(zones)} zones")
+
+    episodes_df = pd.DataFrame(episodes)
+    if not episodes_df.empty:
+        # --- Create Cohort Columns ---
+        episodes_df['hour_at_touch'] = episodes_df['minute_of_day_at_touch'] // 60
+        for col in ['atr_at_touch', 'rvol_at_touch', 'stoch_k_at_touch']:
+            try:
+                episodes_df[f'{col.split("_")[0]}_tercile'] = pd.qcut(episodes_df[col].rank(method='first'), 3, labels=["low", "mid", "high"])
+            except (ValueError, TypeError):
+                episodes_df[f'{col.split("_")[0]}_tercile'] = "n/a"
+
+        if zones:
+            zones_df = pd.DataFrame([dataclasses.asdict(z) for z in zones])
+            episodes_df = episodes_df.merge(zones_df[['id', 'activation_time']], left_on='zone_id', right_on='id', how='left')
+            episodes_df['touch_time'] = pd.to_datetime(episodes_df['touch_time'])
+            episodes_df['activation_time'] = pd.to_datetime(episodes_df['activation_time'])
+            episodes_df['zone_age_days'] = (episodes_df['touch_time'] - episodes_df['activation_time']).dt.days
+        else:
+            episodes_df['zone_age_days'] = np.nan
+
+        episodes_df['approach_direction'] = episodes_df['from_above'].apply(lambda x: 'from_above' if x is True else 'from_below' if x is False else 'inside')
+
+        # --- Build Strata for Analysis ---
+        strata = {"all": episodes_df}
+        simple_strata_cols = {"rth": episodes_df["is_rth_at_touch"] == True, "eth": episodes_df["is_rth_at_touch"] == False, "from_above": episodes_df["approach_direction"] == "from_above", "from_below": episodes_df["approach_direction"] == "from_below"}
+        for name, mask in simple_strata_cols.items(): strata[name] = episodes_df[mask]
+        grouped_strata_cols = ['hour_at_touch', 'atr_tercile', 'rvol_tercile', 'stoch_tercile', 'touch_number']
+        for col in grouped_strata_cols:
+            for name, group in episodes_df.groupby(col):
+                if not pd.isna(name): strata[f"{col.replace('_at_touch','').replace('_tercile','').lower()}_{name}"] = group
+        stratified_stats = {name: compute_statistics(data.to_dict('records'), config) for name, data in strata.items() if not data.empty}
+    else:
+        stratified_stats = {"all": compute_statistics([], config)}
+
+    return {"zones": zones, "episodes": episodes, "statistics": stratified_stats, "data_shape": df.shape}
+
+def compute_survival_analysis(bars_to_outcome: np.ndarray, config: EngineConfig) -> Dict[str, Any]:
+    """Computes survival curve and median time to outcome."""
+    times, counts = np.unique(bars_to_outcome, return_counts=True)
+    cumulative_counts = np.cumsum(counts)
+    survival_prob = 1.0 - cumulative_counts / len(bars_to_outcome)
+
+    if 0 not in times:
+        times = np.insert(times, 0, 0)
+        survival_prob = np.insert(survival_prob, 0, 1.0)
+    else:
+        survival_prob = np.insert(survival_prob[:-1], 0, 1.0)
+
+    return {
+        "median_bars_to_outcome": float(np.median(bars_to_outcome)),
+        "median_bars_to_outcome_ci": block_bootstrap_ci(bars_to_outcome, np.median, seed=config.random_seed),
+        "curve": {"t": times.tolist(), "s": survival_prob.tolist()}
+    }
+
+def compute_cvar(data: np.ndarray, alpha: float = 0.95) -> Optional[float]:
+    """Computes Conditional Value at Risk (CVaR) at a given alpha level."""
+    if len(data) == 0: return None
+    if len(data) < 30:
+        top_5_pct_idx = int(np.ceil(len(data) * 0.95))
+        return float(np.mean(np.sort(data)[top_5_pct_idx:]))
+
+    var = np.percentile(data, alpha * 100)
+    cvar = data[data > var].mean()
+    return float(cvar)
+
+def compute_calibration_table(episodes: List[Dict]) -> List[Dict[str, Any]]:
+    """Computes a calibration table for a given scoring rule."""
+    if not episodes or len(episodes) < 20: return []
+
+    df = pd.DataFrame(episodes)
+    df['zone_type_val'] = df['zone_type'].apply(lambda zt: zt.value if isinstance(zt, Enum) else zt)
+    is_support = df['zone_type_val'] == ZoneType.SUPPORT.value
+    df['calibration_score'] = np.where(is_support, 100 - df['stoch_k_at_touch'], df['stoch_k_at_touch'])
+
+    df = df.dropna(subset=['calibration_score'])
+    if len(df) < 20: return []
+
+    try:
+        df['score_decile'] = pd.qcut(df['calibration_score'].rank(method='first'), 10, labels=False, duplicates='drop')
+    except ValueError:
+        return []
+
+    table = []
+    for decile, group in df.groupby('score_decile'):
+        respect_rate = (group['outcome'].apply(lambda o: (o.value if isinstance(o, Enum) else o) == EpisodeOutcome.RESPECT.value)).mean()
+        table.append({
+            "decile": int(decile) + 1,
+            "n_episodes": len(group),
+            "mean_score": float(group['calibration_score'].mean()),
+            "respect_rate": float(respect_rate)
+        })
+    return table
+
+def compute_statistics(episodes: List[Dict], config: EngineConfig, alpha: float = 0.05) -> Dict[str, Any]:
+    """Compute statistics with proper confidence intervals"""
+    valid_episodes = [e for e in episodes if e["outcome"] != EpisodeOutcome.INVALID]
+    n_invalid, n_episodes = len(episodes) - len(valid_episodes), len(valid_episodes)
+
+    stats = {
+        "n_episodes": n_episodes, "n_invalid_episodes": n_invalid, "outcome_distribution": {},
+        "outcome_rates": {}, "outcome_rates_ci": {}, "bootstrapped_metrics": {},
+        "survival_analysis": {}, "tail_risk": {}, "calibration": []
+    }
+
+    if n_episodes == 0: return stats
+
+    outcomes = np.array([(e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"]) for e in valid_episodes])
+    for outcome in EpisodeOutcome:
+        if outcome == EpisodeOutcome.INVALID: continue
+        count = np.sum(outcomes == outcome.value)
+        stats["outcome_distribution"][outcome.value] = int(count)
+        stats["outcome_rates"][outcome.value] = count / n_episodes if n_episodes > 0 else 0
+
+    if n_episodes < MIN_EPISODES_FOR_STATS: return stats
+
+    for outcome_str, rate in stats["outcome_rates"].items():
+        if HAVE_SCIPY:
+            from scipy.stats import beta
+            k = stats["outcome_distribution"][outcome_str]
+            ci = beta.interval(1-alpha, k+0.5, n_episodes-k+0.5) if k > 0 and k < n_episodes else (0,0)
+            stats["outcome_rates_ci"][outcome_str] = (ci[0], ci[1])
+
+    for metric_name in ["bars_to_outcome", "max_favorable", "max_adverse"]:
+        data = np.array([e[metric_name] for e in valid_episodes if e.get(metric_name) is not None])
+        if len(data) > 1:
+            block_size = config.episode.T // 2 or 5
+            stats["bootstrapped_metrics"][metric_name] = {
+                "mean": np.mean(data), "median": np.median(data), "p25": np.percentile(data, 25), "p75": np.percentile(data, 75),
+                "mean_ci": block_bootstrap_ci(data, np.mean, n_boot=1000, block_size=block_size, seed=config.random_seed),
+                "median_ci": block_bootstrap_ci(data, np.median, n_boot=1000, block_size=block_size, seed=config.random_seed)
+            }
+
+    bars_to_outcome = np.array([e['bars_to_outcome'] for e in valid_episodes if 'bars_to_outcome' in e])
+    if len(bars_to_outcome) > 0:
+        stats["survival_analysis"] = compute_survival_analysis(bars_to_outcome, config)
+
+    adverse_excursions = np.array([e['max_adverse'] for e in valid_episodes if 'max_adverse' in e])
+    if len(adverse_excursions) > 0:
+        stats["tail_risk"]["cvar_95_adverse_excursion"] = compute_cvar(adverse_excursions)
+
+    stats["calibration"] = compute_calibration_table(valid_episodes)
+    return stats
+
+import sqlite3
+import uuid
+
+##############################################################################
+# 8. PERSISTENCE (SQLite writer/reader)
+##############################################################################
+
+class SQLitePersistence:
+    """Handles persistence of run data to a SQLite database."""
+    def __init__(self, db_path: str):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA foreign_keys = 1;")
+        self.create_tables()
+
+    def close(self):
+        self.conn.commit()
+        self.conn.close()
+
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            run_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_uuid TEXT NOT NULL UNIQUE,
+            run_timestamp TEXT NOT NULL,
+            command TEXT,
+            config_json TEXT,
+            engine_config_json TEXT,
+            data_hashes_json TEXT
+        )""")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS zones (
+            zone_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_fk INTEGER NOT NULL,
+            zone_id_in_run INTEGER NOT NULL,
+            zone_type TEXT, level REAL, width REAL,
+            activation_time TEXT, p_value REAL,
+            FOREIGN KEY(run_fk) REFERENCES runs(run_pk) ON DELETE CASCADE
+        )""")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            episode_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_fk INTEGER NOT NULL,
+            zone_id_in_run INTEGER NOT NULL,
+            outcome TEXT, touch_time TEXT, outcome_time TEXT,
+            bars_to_outcome INTEGER, max_favorable REAL, max_adverse REAL, touch_number INTEGER,
+            FOREIGN KEY(run_fk) REFERENCES runs(run_pk) ON DELETE CASCADE
+        )""")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS statistics (
+            stat_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_fk INTEGER NOT NULL,
+            cohort TEXT NOT NULL,
+            stats_json TEXT NOT NULL,
+            FOREIGN KEY(run_fk) REFERENCES runs(run_pk) ON DELETE CASCADE
+        )""")
+        self.conn.commit()
+
+    def insert_run(self, metadata: Dict) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT INTO runs (run_uuid, run_timestamp, command, config_json, engine_config_json, data_hashes_json) VALUES (?, ?, ?, ?, ?, ?)",
+                       (metadata['run_uuid'], metadata['run_timestamp_utc'], metadata['command'], json.dumps(metadata['args']),
+                        json.dumps(metadata['config']), json.dumps(metadata['data_sha256'])))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def insert_zones(self, run_pk: int, zones: List[Zone]):
+        if not zones: return
+        z_data = [(run_pk, z.id, z.type.value, z.level, z.width, z.activation_time.isoformat(), z.p_value) for z in zones]
+        self.conn.cursor().executemany("INSERT INTO zones (run_fk, zone_id_in_run, zone_type, level, width, activation_time, p_value) VALUES (?, ?, ?, ?, ?, ?, ?)", z_data)
+        self.conn.commit()
+
+    def insert_episodes(self, run_pk: int, episodes: List[Dict]):
+        if not episodes: return
+        e_data = [(run_pk, e['zone_id'], e['outcome'].value if isinstance(e['outcome'], Enum) else e['outcome'],
+                   str(e['touch_time']), str(e['outcome_time']), e['bars_to_outcome'], e['max_favorable'],
+                   e['max_adverse'], e['touch_number']) for e in episodes]
+        self.conn.cursor().executemany("INSERT INTO episodes (run_fk, zone_id_in_run, outcome, touch_time, outcome_time, bars_to_outcome, max_favorable, max_adverse, touch_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", e_data)
+        self.conn.commit()
+
+    def insert_statistics(self, run_pk: int, stats: Dict[str, Any]):
+        if not stats: return
+        s_data = [(run_pk, cohort, json.dumps(cohort_stats, default=str)) for cohort, cohort_stats in stats.items()]
+        self.conn.cursor().executemany("INSERT INTO statistics (run_fk, cohort, stats_json) VALUES (?, ?, ?)", s_data)
+        self.conn.commit()
+
+##############################################################################
+# 9. PLOTTING (pngs only)
+##############################################################################
+
+def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str):
+    """Generates and saves distribution plots for key episode metrics."""
+    if episodes_df.empty: return
+    LOG.info(f"Generating distribution plots in {out_dir}...")
+    plt.style.use('seaborn-v0_8-darkgrid')
+    episodes_df["outcome_str"] = episodes_df["outcome"].apply(lambda x: x.value if isinstance(x, Enum) else x)
+    plt.figure(figsize=(10, 6)); episodes_df["outcome_str"].value_counts().plot(kind='bar'); plt.title("Episode Outcome Distribution"); plt.ylabel("Count"); plt.xticks(rotation=45); plt.tight_layout(); plt.savefig(os.path.join(out_dir, "dist_outcomes.png")); plt.close()
+    plt.figure(figsize=(10, 6)); episodes_df["bars_to_outcome"].hist(bins=50, range=(0, episodes_df["bars_to_outcome"].quantile(0.99))); plt.title("Distribution of Bars to Outcome"); plt.xlabel("Number of Bars"); plt.ylabel("Frequency"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, "dist_bars_to_outcome.png")); plt.close()
+    plt.figure(figsize=(12, 6)); plt.subplot(1, 2, 1); episodes_df["max_favorable"].hist(bins=50, color='g', range=(0, episodes_df["max_favorable"].quantile(0.99))); plt.title("Max Favorable Excursion"); plt.xlabel("Points"); plt.subplot(1, 2, 2); episodes_df["max_adverse"].hist(bins=50, color='r', range=(0, episodes_df["max_adverse"].quantile(0.99))); plt.title("Max Adverse Excursion"); plt.xlabel("Points"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, "dist_excursions.png")); plt.close()
+    LOG.info("Distribution plots saved.")
+
+def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], out_dir: str):
+    """Generates and saves daily price charts with zones and episodes."""
+    if df.empty or not zones: return
+    maps_dir = os.path.join(out_dir, "daily_maps"); Path(maps_dir).mkdir(parents=True, exist_ok=True)
+    LOG.info(f"Generating daily maps in {maps_dir}...")
+    episodes_df = pd.DataFrame(episodes)
+    if not episodes_df.empty: episodes_df["touch_time"], episodes_df["outcome_time"] = pd.to_datetime(episodes_df["touch_time"]), pd.to_datetime(episodes_df["outcome_time"])
+    local_tz = df["local_time"].dt.tz or "UTC"
+    def to_local_date(ts): return pd.Timestamp(ts, tz="UTC").tz_convert(local_tz).date()
+    for session, day_df in df.groupby("session_date"):
+        fig, ax = plt.subplots(figsize=(15, 8)); ax.plot(day_df["timestamp"], day_df["close"], label="Close", color='black', linewidth=0.5)
+        for zone in zones:
+            if to_local_date(zone.activation_time) <= session <= to_local_date(zone.activation_time + pd.Timedelta(days=zone.expire_days)):
+                color = 'green' if zone.type == ZoneType.SUPPORT else 'red'
+                ax.axhspan(zone.level - zone.width, zone.level + zone.width, alpha=0.1, color=color)
+                ax.axhline(zone.level, color=color, linestyle='--', linewidth=0.7)
+        if not episodes_df.empty:
+            day_episodes = episodes_df[episodes_df["touch_time"].dt.date == session]
+            for _, episode in day_episodes.iterrows():
+                outcome_str = episode['outcome'].value if isinstance(episode['outcome'], Enum) else episode['outcome']
+                outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(outcome_str, 'grey')
+                touch_price = df.iloc[df['timestamp'].searchsorted(episode['touch_time'])]['close']
+                ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
+                ax.text(episode['outcome_time'], touch_price, f"{outcome_str} (T{episode['touch_number']})", color=outcome_color, fontsize=9)
+        ax.set_title(f"Market Map for {session.strftime('%Y-%m-%d')}"); ax.set_ylabel("Price"); ax.grid(True, linestyle='--', alpha=0.5); fig.autofmt_xdate(); plt.tight_layout(); plt.savefig(os.path.join(maps_dir, f"map_{session.strftime('%Y-%m-%d')}.png")); plt.close(fig)
+    LOG.info("Daily maps saved.")
+
+def save_respect_rate_heatmap(*args, **kwargs):
+    """Placeholder for R/O heatmap generation."""
+    LOG.debug("Heatmap generation is not implemented for single runs in this version.")
+    pass
+
+##############################################################################
+# 10. REPORT (single-file HTML with embedded PNGs)
+##############################################################################
+# To be added in a future step.
+
+##############################################################################
+# 11. CLI & MAIN
+##############################################################################
+
+def load_engine_config(path: Optional[str]) -> EngineConfig:
+    """Loads engine config from YAML/JSON, overriding defaults."""
+    cfg = EngineConfig()
+    if not path or not os.path.exists(path):
+        if path: LOG.warning(f"Config file not found at {path}, using defaults.")
+        return cfg
+    LOG.info(f"Loading config from {path}")
+    with open(path, "r") as f:
+        if path.lower().endswith((".yml", ".yaml")):
+            if not HAVE_YAML: raise ImportError("pyyaml is required for YAML configs. `pip install pyyaml`")
+            raw = yaml.safe_load(f)
+        else: raw = json.load(f)
+    update_dataclass_from_dict(cfg, raw)
+    return cfg
+
+def walk_forward_slices(df: pd.DataFrame, window: str, step: str, test_size: Optional[str] = None) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Generates walk-forward training and testing slices."""
+    if df.empty: return []
+    window_td, step_td = pd.to_timedelta(window), pd.to_timedelta(step)
+    test_td = pd.to_timedelta(test_size) if test_size else step_td
+    slices, start_date, end_date = [], df['timestamp'].min(), df['timestamp'].max()
+    train_start = start_date
+    while train_start + window_td + test_td <= end_date:
+        train_end, test_end = train_start + window_td, train_start + window_td + test_td
+        train_df = df[(df['timestamp'] >= train_start) & (df['timestamp'] < train_end)]
+        test_df = df[(df['timestamp'] >= train_end) & (df['timestamp'] < test_end)]
+        if not train_df.empty and not test_df.empty:
+            slices.append((train_df.copy(), test_df.copy()))
+        train_start += step_td
+    return slices
+
+def run_walk_forward_analysis(df: pd.DataFrame, config: EngineConfig, wf_params: Dict[str, str]):
+    """Runs the analysis pipeline using walk-forward validation."""
+    slices = walk_forward_slices(df, window=wf_params['window'], step=wf_params['step'])
+    if not slices:
+        LOG.error("Could not generate any walk-forward slices from the data."); return None
+    LOG.info(f"Starting walk-forward analysis with {len(slices)} slices.")
+
+    all_oos_episodes, per_slice_stats = [], []
+    for i, (train_df, test_df) in enumerate(slices):
+        LOG.info(f"--- Processing slice {i+1}/{len(slices)}: Train {train_df['timestamp'].min().date()}->{train_df['timestamp'].max().date()}, Test {test_df['timestamp'].min().date()}->{test_df['timestamp'].max().date()} ---")
+        zones = discover_zones(train_df, config)
+        if not zones: LOG.warning("No zones discovered in training period. Skipping slice."); continue
+
+        oos_episodes = evaluate_episodes(test_df, zones, config)
+        if oos_episodes:
+            all_oos_episodes.extend(oos_episodes)
+            slice_stats = compute_statistics(oos_episodes, config)
+            per_slice_stats.append({"slice_num": i + 1, "stats": slice_stats})
+
+    LOG.info("--- Walk-Forward Analysis Complete ---")
+    aggregated_stats = compute_statistics(all_oos_episodes, config)
+    return {"aggregated_statistics": aggregated_stats, "per_slice_statistics": per_slice_stats, "all_oos_episodes": all_oos_episodes}
+
+import base64
+
+def save_cohort_lift_plot(statistics: Dict[str, Any], out_dir: str):
+    base_respect_rate = statistics.get("all", {}).get("outcome_rates", {}).get("RESPECT", 0.0)
+    if base_respect_rate == 0.0: return
+
+    cohort_lifts = []
+    for name, stats in statistics.items():
+        if name == "all" or stats["n_episodes"] < MIN_EPISODES_FOR_STATS: continue
+        cohort_rate = stats["outcome_rates"].get("RESPECT", 0.0)
+        lift = cohort_rate - base_respect_rate
+        cohort_lifts.append({"name": name, "lift": lift})
+
+    if not cohort_lifts: return
+
+    top_n = sorted(cohort_lifts, key=lambda x: x["lift"], reverse=True)[:10]
+    df = pd.DataFrame(top_n).set_index('name')
+
+    plt.figure(figsize=(10, 8))
+    df['lift'].plot(kind='barh', color=df['lift'].apply(lambda x: 'g' if x > 0 else 'r'))
+    plt.title('Top 10 Cohorts by Respect Rate Lift')
+    plt.xlabel('Lift over Baseline Respect Rate')
+    plt.axvline(0, color='black', linestyle='--')
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "plot_cohort_lift.png"))
+    plt.close()
+
+def generate_html_report(results: Dict[str, Any], out_dir: str, config: EngineConfig):
+    """Generates a single-file HTML report with embedded images."""
+
+    def embed_img(path: str) -> str:
+        if not os.path.exists(path): return ""
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode('utf-8')
+        return f'<img src="data:image/png;base64,{encoded}" alt="{os.path.basename(path)}" style="width:100%; max-width:600px;">'
+
+    all_stats = results['statistics'].get('all', {})
+    if not all_stats: return
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Market Stats Report: {config.instrument.symbol}</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 2em; }}
+            h1, h2 {{ color: #333; }}
+            table {{ border-collapse: collapse; width: 100%; max-width: 800px; margin-bottom: 2em; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+        </style>
+    </head>
+    <body>
+        <h1>Market Statistics Report: {config.instrument.symbol}</h1>
+        <h2>Overall Performance</h2>
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Total Episodes</td><td>{all_stats.get('n_episodes', 'N/A')}</td></tr>
+            <tr><td>Respect Rate</td><td>{all_stats.get('outcome_rates', {}).get('RESPECT', 0):.2%}</td></tr>
+            <tr><td>Respect Rate CI</td><td>{all_stats.get('outcome_rates_ci', {}).get('RESPECT', (0,0))[0]:.2%} - {all_stats.get('outcome_rates_ci', {}).get('RESPECT', (0,0))[1]:.2%}</td></tr>
+            <tr><td>Median Bars to Outcome</td><td>{all_stats.get('survival_analysis', {}).get('median_bars_to_outcome', 'N/A')}</td></tr>
+            <tr><td>CVaR95 Adverse Excursion</td><td>{all_stats.get('tail_risk', {}).get('cvar_95_adverse_excursion', 0):.2f} points</td></tr>
+        </table>
+
+        <h2>Outcome Distributions</h2>
+        {embed_img(os.path.join(out_dir, 'dist_outcomes.png'))}
+
+        <h2>Top Cohorts by Lift</h2>
+        {embed_img(os.path.join(out_dir, 'plot_cohort_lift.png'))}
+
+        <h2>Calibration</h2>
+        <table>
+            <tr><th>Decile</th><th>Mean Score</th><th>N Episodes</th><th>Observed Respect Rate</th></tr>
+    """
+
+    cal_table = all_stats.get('calibration', [])
+    if cal_table:
+        for row in sorted(cal_table, key=lambda x: x['decile']):
+            html += f"<tr><td>{row['decile']}</td><td>{row['mean_score']:.1f}</td><td>{row['n_episodes']}</td><td>{row['respect_rate']:.2%}</td></tr>"
+
+    html += """
+        </table>
+    </body>
+    </html>
+    """
+
+    report_path = os.path.join(out_dir, "report.html")
+    with open(report_path, "w") as f:
+        f.write(html)
+    LOG.info(f"HTML report saved to {report_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="market_stats_engine",
-        description="Production-ready market statistics engine"
-    )
-    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    parser = argparse.ArgumentParser(prog="market_stats_engine", description="Production-ready market statistics engine")
+    subparsers = parser.add_subparsers(dest="command", help="Commands", required=True)
 
-    # Prepare command
+    # --- Prepare Command ---
     prep_parser = subparsers.add_parser("prepare", help="Prepare and validate data")
-    prep_parser.add_argument("--files", nargs="+", required=True, help="Input files")
+    prep_parser.add_argument("--files", nargs="+", required=True, help="Input files (CSV or Parquet)")
     prep_parser.add_argument("--out", default="cache/prepared.parquet", help="Output file")
-    prep_parser.add_argument("--config", help="Config file (YAML/JSON)")
+    prep_parser.add_argument("--config", help="Engine config file (YAML/JSON)")
 
-    # Analyze command
+    # --- Analyze Command ---
     analyze_parser = subparsers.add_parser("analyze", help="Run statistical analysis")
     analyze_parser.add_argument("--data", required=True, help="Prepared data file")
-    analyze_parser.add_argument("--config", help="Config file (YAML/JSON)")
+    analyze_parser.add_argument("--config", help="Engine config file (YAML/JSON)")
     analyze_parser.add_argument("--out", default="results/", help="Output directory")
+    analyze_parser.add_argument("--wf", help='Enable walk-forward validation. e.g., "window=90d,step=30d"')
+    analyze_parser.add_argument("--db", help="Path to SQLite database for results lineage.")
+    analyze_parser.add_argument("--report", action="store_true", help="Generate a single-file HTML report.")
+    analyze_parser.add_argument("--seed", type=int, help="Random seed for reproducible results.")
+    analyze_parser.add_argument("--dry-run", action="store_true", help="Print config and plan without executing.")
+    analyze_parser.add_argument("--engine", default="pandas", choices=["pandas", "fast"], help="Execution engine ('fast' enables polars).")
 
-    # Sweep command
+    # --- Sweep Command ---
     sweep_parser = subparsers.add_parser("sweep", help="Parameter sweep")
     sweep_parser.add_argument("--data", required=True, help="Prepared data file")
-    sweep_parser.add_argument("--grid", required=True, help="Parameter grid file")
+    sweep_parser.add_argument("--grid", required=True, help="Parameter grid file (JSON or YAML)")
     sweep_parser.add_argument("--out", default="sweep_results/", help="Output directory")
+    sweep_parser.add_argument("--db", help="Path to SQLite database for results lineage.")
+    sweep_parser.add_argument("--jobs", type=int, default=1, help="Number of parallel jobs for sweep.")
+    sweep_parser.add_argument("--seed", type=int, help="Random seed for reproducible results.")
+
+    # --- Self-test Command ---
+    selftest_parser = subparsers.add_parser("self-test", help="Run a quick synthetic data test.")
 
     return parser
+
+from multiprocessing import Pool
+from functools import partial
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.command:
-        parser.print_help()
+    if args.command == "self-test":
+        run_self_test()
         return
 
-    # Load config from file if provided
-    config_path = getattr(args, 'config', None)
-    config = load_engine_config(config_path)
+    config = load_engine_config(getattr(args, 'config', None))
+    if hasattr(args, 'seed') and args.seed is not None:
+        config.random_seed = args.seed
+        LOG.info(f"Using random seed: {config.random_seed}")
 
-    # Create output directory and save run metadata
-    if args.command in ["prepare", "analyze"]:
-        if args.command == "analyze":
-            out_dir = args.out
-        else:  # prepare
+    if hasattr(args, 'engine') and args.engine == 'fast':
+        if HAVE_POLARS:
+            LOG.info("Using 'fast' engine (Polars where available).")
+        else:
+            LOG.warning("Engine 'fast' selected but Polars not found. Falling back to pandas.")
+
+    if hasattr(args, 'dry_run') and args.dry_run:
+        LOG.info("--- Dry Run Mode ---")
+        LOG.info("Configuration:")
+        LOG.info(json.dumps(dataclasses.asdict(config), indent=2, default=str))
+        LOG.info(f"Command to be executed: {args.command}")
+        return
+
+    persistence = None
+    try:
+        if getattr(args, 'db', None):
+            persistence = SQLitePersistence(args.db)
+            LOG.info(f"Initialized SQLite persistence at {args.db}")
+
+        out_dir = args.out if hasattr(args, 'out') else 'results'
+        if args.command == 'prepare':
             out_dir = str(Path(args.out).parent)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-        # Gather metadata
-        run_time = dt.datetime.now(dt.timezone.utc).isoformat()
-
-        try:
-            code_hash = get_file_sha256(__file__)
-        except FileNotFoundError:
-            code_hash = "n/a"
-
-        if args.command == "prepare":
-            data_hashes = {f: get_file_sha256(f) for f in args.files}
-        else:  # analyze
-            data_hashes = {args.data: get_file_sha256(args.data)}
-
-        metadata = {
-            "run_timestamp_utc": run_time,
-            "command": args.command,
-            "args": vars(args),
-            "code_sha256": code_hash,
-            "data_sha256": data_hashes,
+        base_metadata = {
+            "run_uuid": str(uuid.uuid4()), "run_timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "command": args.command, "args": vars(args), "code_sha256": get_file_sha256(__file__),
+            "data_sha256": {f: get_file_sha256(f) for f in (args.files if hasattr(args, 'files') else (getattr(args, 'data', None) and [args.data])) if f},
             "config": dataclasses.asdict(config)
         }
+        with open(os.path.join(out_dir, "run_metadata.json"), "w") as f: json.dump(base_metadata, f, indent=2, default=str)
+        LOG.info(f"Saved run metadata to {os.path.join(out_dir, 'run_metadata.json')}")
 
-        # Save metadata
-        metadata_path = os.path.join(out_dir, "run_metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2, default=str)
-        LOG.info(f"Saved run metadata to {metadata_path}")
+        if args.command == "prepare":
+            df_iter = tqdm(args.files, desc="Preparing files") if tqdm else args.files
+            df = prepare_data(df_iter, config)
+            out_path = args.out
+            if out_path.endswith(".parquet"):
+                if HAVE_PARQUET: df.to_parquet(out_path, index=False)
+                else: out_path = out_path.replace(".parquet", ".csv"); df.to_csv(out_path, index=False); LOG.warning("pyarrow not found.")
+            else: df.to_csv(out_path, index=False)
+            LOG.info(f"Saved prepared data to {out_path}, shape: {df.shape}")
 
-    if args.command == "prepare":
-        # Prepare and validate data
-        df = prepare_data(args.files, config)
+        elif args.command == "analyze":
+            df = pd.read_parquet(args.data) if args.data.endswith(".parquet") else pd.read_csv(args.data)
+            df = ensure_prepared(df, config)
+            run_pk = persistence.insert_run(base_metadata) if persistence else None
 
-        # Save prepared data
-        # Output directory is already created by metadata logic
-        out_path = args.out
-        if out_path.endswith(".parquet"):
-            if HAVE_PARQUET:
-                df.to_parquet(out_path, index=False)
+            if args.wf:
+                wf_config = {}
+                try:
+                    for part in args.wf.replace(" ", "").split(','): key, value = part.split('='); wf_config[key.strip()] = value.strip()
+                    if 'window' not in wf_config or 'step' not in wf_config: raise ValueError("window and step required")
+                except Exception as e: LOG.error(f"Invalid --wf format: {e}. Use 'window=90d,step=30d'."); return
+
+                wf_results = run_walk_forward_analysis(df, config, wf_config)
+                if wf_results:
+                    with open(f"{args.out}/statistics_walkforward.json", "w") as f: json.dump(wf_results["aggregated_statistics"], f, indent=2, default=str)
+                    pd.DataFrame(wf_results["all_oos_episodes"]).to_csv(f"{args.out}/episodes_walkforward.csv", index=False)
+                    if persistence and run_pk:
+                        persistence.insert_statistics(run_pk, {"aggregated_walkforward": wf_results['aggregated_statistics']})
+                        persistence.insert_episodes(run_pk, wf_results['all_oos_episodes'])
+                    agg_stats = wf_results["aggregated_statistics"]
+                    if agg_stats["n_episodes"] > 0:
+                        respect_rate = agg_stats["outcome_rates"].get("RESPECT", 0.0); ci = agg_stats["outcome_rates_ci"].get("RESPECT", (None, None))
+                        LOG.info(f"--- OOS Walk-Forward Results ---")
+                        LOG.info(f"Overall OOS Respect rate: {respect_rate:.2%} (CI: {f'({ci[0]:.2%}, {ci[1]:.2%})' if ci[0] is not None else 'N/A'})")
             else:
-                out_path = out_path.replace(".parquet", ".csv")
-                df.to_csv(out_path, index=False)
-                LOG.warning("pyarrow not found, saving as CSV instead.")
-        else:
-            df.to_csv(out_path, index=False)
+                results = run_analysis(df, config)
+                pd.DataFrame([dataclasses.asdict(z) for z in results["zones"]]).to_csv(f"{args.out}/zones.csv", index=False)
+                pd.DataFrame(results["episodes"]).to_csv(f"{args.out}/episodes.csv", index=False)
+                with open(f"{args.out}/statistics.json", "w") as f: json.dump(results["statistics"], f, indent=2, default=str)
+                LOG.info(f"Results saved to {args.out}. Zones: {len(results['zones'])}, Episodes: {len(results['episodes'])}")
+                if persistence and run_pk:
+                    persistence.insert_zones(run_pk, results['zones']); persistence.insert_episodes(run_pk, results['episodes']); persistence.insert_statistics(run_pk, results['statistics'])
 
-        LOG.info(f"Saved prepared data to {out_path}")
-        LOG.info(f"Shape: {df.shape}")
-        LOG.info(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+                if "all" in results["statistics"] and results["statistics"]["all"]["n_episodes"] > 0:
+                    all_stats = results["statistics"]["all"]; respect_rate = all_stats["outcome_rates"].get("RESPECT", 0.0); ci = all_stats["outcome_rates_ci"].get("RESPECT")
+                    LOG.info(f"Overall Respect rate: {respect_rate:.2%} (CI: {f'({ci[0]:.2%}, {ci[1]:.2%})' if ci and ci[0] is not None else 'N/A'})")
+                    base_respect_rate = results["statistics"]["all"]["outcome_rates"].get("RESPECT", 0.0)
+                    cohort_lifts = []
+                    for name, stats in results["statistics"].items():
+                        if name == "all" or stats["n_episodes"] < MIN_EPISODES_FOR_STATS: continue
+                        cohort_rate = stats["outcome_rates"].get("RESPECT", 0.0)
+                        lift = cohort_rate - base_respect_rate
+                        cohort_lifts.append({"name": name, "lift": lift, "rate": cohort_rate, "n": stats["n_episodes"]})
+                    if cohort_lifts:
+                        top_cohorts = sorted(cohort_lifts, key=lambda x: x["lift"], reverse=True)[:3]
+                        LOG.info("--- Top 3 Cohorts by Respect Rate Lift ---")
+                        for cohort in top_cohorts: LOG.info(f"  - {cohort['name']}: {cohort['rate']:.2%} (Lift: {cohort['lift']:+.2%}, n={cohort['n']})")
 
-    elif args.command == "analyze":
-        # Load prepared data
-        if args.data.endswith(".parquet"):
-            if not HAVE_PARQUET:
-                raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
-            df = pd.read_parquet(args.data)
-        else:
-            df = pd.read_csv(args.data)
+                plot_episodes_df = pd.DataFrame(results["episodes"])
+                save_distribution_plots(plot_episodes_df, args.out)
+                save_daily_maps(df, results["zones"], results["episodes"], args.out)
 
-        df = _ensure_utc_timestamps(df)
-        df = ensure_prepared(df, config)
+                if args.report:
+                    LOG.info("Generating HTML report...")
+                    save_cohort_lift_plot(results["statistics"], args.out)
+                    generate_html_report(results, args.out, config)
 
-        # Run analysis
-        results = run_analysis(df, config)
+        elif args.command == "sweep":
+            df = pd.read_parquet(args.data) if args.data.endswith(".parquet") else pd.read_csv(args.data)
+            df = ensure_prepared(df, config)
+            with open(args.grid, "r") as f: param_grid = yaml.safe_load(f) if args.grid.lower().endswith((".yml", ".yaml")) else json.load(f)
 
-        # Save results
-        # Output directory is already created by metadata logic
+            config_dict = dataclasses.asdict(config)
+            task_args = [(params, config_dict, df, base_metadata, persistence) for params in param_grid]
 
-        # Save zones
-        zones_data = [{
-            "id": z.id,
-            "type": z.type.value,
-            "level": z.level,
-            "width": z.width,
-            "p_value": z.p_value,
-            "is_significant": z.is_significant,
-            "n_touches": len(z.touches),
-            "activation_time": z.activation_time.isoformat(),
-            "expiry_time": (z.activation_time + pd.Timedelta(days=z.expire_days)).isoformat(),
-        } for z in results["zones"]]
-        pd.DataFrame(zones_data).to_csv(f"{args.out}/zones.csv", index=False)
-
-        # Save episodes
-        episodes_df = pd.DataFrame(results["episodes"])
-        if not episodes_df.empty:
-            # Convert Enums to string values for clean CSV export
-            episodes_df["outcome"] = episodes_df["outcome"].apply(lambda x: x.value if hasattr(x, "value") else x)
-            episodes_df["zone_type"] = episodes_df["zone_type"].apply(lambda x: x.value if hasattr(x, "value") else x)
-        episodes_df.to_csv(f"{args.out}/episodes.csv", index=False)
-
-        # Save statistics
-        with open(f"{args.out}/statistics.json", "w") as f:
-            json.dump(results["statistics"], f, indent=2, default=str)
-
-        LOG.info(f"Results saved to {args.out}")
-        LOG.info(f"Zones: {len(results['zones'])}")
-        LOG.info(f"Episodes: {len(results['episodes'])}")
-
-        if "all" in results["statistics"] and results["statistics"]["all"]["n_episodes"] > 0:
-            all_stats = results["statistics"]["all"]
-            respect_rate = all_stats["outcome_rates"].get("RESPECT", 0.0)
-            ci = all_stats["outcome_rates_ci"].get("RESPECT")
-            ci_str = f"({ci[0]:.2%}, {ci[1]:.2%})" if ci and ci[0] is not None else "N/A"
-            LOG.info(f"Overall Respect rate: {respect_rate:.2%} (CI: {ci_str})")
-
-        # Generate and save plots
-        # Re-create DF with enum values for plotting function
-        plot_episodes_df = pd.DataFrame(results["episodes"])
-        if not plot_episodes_df.empty:
-            plot_episodes_df["outcome"] = plot_episodes_df["outcome"].apply(lambda x: x.value)
-        save_distribution_plots(plot_episodes_df, args.out)
-        save_daily_maps(df, results["zones"], results["episodes"], args.out)
-
-    elif args.command == "sweep":
-        LOG.info("--- Starting Parameter Sweep ---")
-
-        # Load data
-        LOG.info(f"Loading data from {args.data}")
-        if args.data.endswith(".parquet"):
-            if not HAVE_PARQUET:
-                raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
-            df = pd.read_parquet(args.data)
-        else:
-            df = pd.read_csv(args.data)
-
-        df = _ensure_utc_timestamps(df)
-        df = ensure_prepared(df, config)
-
-        # Load parameter grid
-        LOG.info(f"Loading parameter grid from {args.grid}")
-        with open(args.grid, "r") as f:
-            if args.grid.lower().endswith((".yml", ".yaml")):
-                if not HAVE_YAML: raise ImportError("pyyaml is required for YAML grid file.")
-                param_grid = yaml.safe_load(f)
+            if args.jobs > 1 and HAVE_MULTIPROCESSING:
+                LOG.info(f"Starting parallel sweep with {args.jobs} jobs.")
+                with Pool(args.jobs) as pool:
+                    results_iterator = pool.imap(run_sweep_item, task_args)
+                    if tqdm: results_iterator = tqdm(results_iterator, total=len(param_grid), desc="Sweeping parameters")
+                    summary_results = list(results_iterator)
             else:
-                param_grid = json.load(f)
+                LOG.info("Starting serial sweep.")
+                iterator = tqdm(task_args, desc="Sweeping parameters") if tqdm else task_args
+                summary_results = [run_sweep_item(arg_tuple) for arg_tuple in iterator]
 
-        if not isinstance(param_grid, list):
-            raise ValueError("Parameter grid file must contain a JSON list of configurations.")
+            pd.DataFrame(summary_results).to_csv(os.path.join(out_dir, "sweep_summary.csv"), index=False)
+            LOG.info(f"--- Sweep complete. Summary at {os.path.join(out_dir, 'sweep_summary.csv')} ---")
 
-        # Prepare for sweep
-        Path(args.out).mkdir(parents=True, exist_ok=True)
-        summary_results = []
+    finally:
+        if persistence:
+            persistence.close()
+            LOG.info("Database connection closed.")
 
-        LOG.info(f"Found {len(param_grid)} parameter sets to sweep.")
+##############################################################################
+# 12. SELF-TEST (tiny synthetic run; optional)
+##############################################################################
+# To be added in a future step.
 
-        for i, params in enumerate(param_grid):
-            # Create config for this run
-            run_config = EngineConfig()
-            update_dataclass_from_dict(run_config, params)
+# Top-level function for multiprocessing sweep
+def run_sweep_item(args_tuple):
+    params, config_dict, data_df = args_tuple
+    # Must reconstruct the config object in the new process
+    run_config = EngineConfig()
+    update_dataclass_from_dict(run_config, config_dict)
+    update_dataclass_from_dict(run_config, params)
 
-            run_id = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:10]
-            LOG.info(f"--- Running sweep {i+1}/{len(param_grid)} (ID: {run_id}) ---")
+    results = run_analysis(data_df.copy(), run_config)
+    all_stats = results["statistics"].get("all", {})
+    summary_row = {"params": json.dumps(params), "n_valid_episodes": all_stats.get("n_episodes", 0)}
+    if all_stats.get("n_episodes", 0) > 0:
+        summary_row.update({f"{k.lower()}_rate": v for k, v in all_stats.get("outcome_rates", {}).items()})
+    return summary_row
 
-            # Run analysis
-            results = run_analysis(df.copy(), run_config) # Use copy of df to be safe
+##############################################################################
+# 12. SELF-TEST (tiny synthetic run; optional)
+##############################################################################
 
-            # Extract summary stats
-            all_stats = results["statistics"].get("all", {})
-            n_episodes = all_stats.get("n_episodes", 0)
+def run_self_test():
+    """Generates a tiny synthetic OHLC series and runs the full pipeline."""
+    LOG.info("--- Running Self-Test ---")
+    # 1. Generate synthetic data with a clear support zone around 100
+    timestamps = pd.to_datetime(pd.date_range(start="2023-01-01 09:30", periods=200, freq="1min", tz="America/New_York"))
+    price = 102.0
+    prices = []
+    for i, ts in enumerate(timestamps):
+        if 50 < i < 100 and np.random.random() > 0.5:
+            price = max(100.0, price - np.random.uniform(0, 1) * 0.25)
+        else:
+            price += np.random.uniform(-1, 1) * 0.25
+        prices.append(price)
 
-            summary_row = {"run_id": run_id, "params": json.dumps(params)}
-            summary_row["n_valid_episodes"] = n_episodes
-            summary_row["n_invalid_episodes"] = all_stats.get("n_invalid_episodes", 0)
-            if n_episodes > 0:
-                summary_row.update({
-                    "respect_rate": all_stats.get("outcome_rates", {}).get("RESPECT"),
-                    "pierce_revert_rate": all_stats.get("outcome_rates", {}).get("PIERCE_AND_REVERT"),
-                    "break_rate": all_stats.get("outcome_rates", {}).get("BREAK"),
-                    "timeout_rate": all_stats.get("outcome_rates", {}).get("TIMEOUT"),
-                })
-            summary_results.append(summary_row)
+    df = pd.DataFrame({
+        "timestamp": timestamps,
+        "open": prices, "high": [p + 0.1 for p in prices],
+        "low": [p - 0.1 for p in prices], "close": prices,
+        "volume": np.random.randint(100, 1000, size=len(prices))
+    })
 
-        # Save summary
-        summary_df = pd.DataFrame(summary_results)
-        summary_path = os.path.join(args.out, "sweep_summary.csv")
-        summary_df.to_csv(summary_path, index=False)
-        LOG.info(f"--- Parameter sweep complete. Summary saved to {summary_path} ---")
+    # 2. Run analysis with default config
+    config = EngineConfig()
+    config.zones.min_touches_for_significance = 2
+    config.zones.significance_test = False # Disable for self-test to ensure zones are found
+    df = ensure_prepared(df, config)
+    results = run_analysis(df, config)
 
-    else:
-        parser.print_help()
+    # 3. Assert basic invariants
+    try:
+        assert len(results["zones"]) > 0, "Self-test failed: No zones detected."
+        assert any(z.type == ZoneType.SUPPORT for z in results["zones"]), "Self-test failed: No support zones."
+        assert len(results["episodes"]) > 0, "Self-test failed: No episodes detected."
+        assert results["statistics"]["all"]["n_episodes"] > 0, "Self-test failed: Zero episodes in stats."
+        LOG.info("--- SELF-TEST OK ---")
+    except AssertionError as e:
+        LOG.error(f"--- SELF-TEST FAILED: {e} ---", exc_info=True)
+        # Optionally re-raise or sys.exit(1)
+        raise
 
 if __name__ == "__main__":
     main()
