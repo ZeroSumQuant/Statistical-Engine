@@ -52,6 +52,17 @@ python market_stats_engine.py sweep --data cache/nq_prepared.parquet --grid swee
 
 # 7. Run the built-in self-test to verify core functionality
 python market_stats_engine.py self-test
+
+# 8. Advanced: Run analysis only for specific market regimes
+# --- my_regimes.yml ---
+# enabled: true
+# regimes:
+#   - name: "Uptrend"
+#     condition: "close > ema_50 & ema_50 > ema_200"
+#   - name: "HighVol"
+#     condition: "atr > atr.rolling(20).mean() * 1.5"
+# ----------------------
+python market_stats_engine.py analyze --data cache/nq_prepared.parquet --regimes my_regimes.yml
 """
 
 # ————————————————————————————————————————————————————————————————————————————
@@ -378,6 +389,7 @@ class Zone:
     p_value: float
     is_significant: bool
     expire_days: int = 30
+    regime: str = "all_data"  # <— new
 
 
 ##############################################################################
@@ -731,15 +743,15 @@ def annotate_regimes(df: pd.DataFrame, regime_config: RegimeConfig) -> pd.DataFr
     for regime in regime_config.regimes:
         col_name = f"regime_{regime.name.lower().replace(' ', '_')}"
         try:
-            # Using engine='python' for more complex queries if needed
-            df[col_name] = df.eval(regime.condition, engine='python')
-            df[col_name] = df[col_name].astype(bool)
-            LOG.debug(f"Annotated regime '{regime.name}' ({df[col_name].sum()} bars)")
+            # query returns the filtered frame; convert to boolean mask
+            idx = df.query(regime.condition, engine='python').index
+            mask = df.index.isin(idx)
+            df[col_name] = mask.astype(bool)
+            LOG.debug(f"Annotated regime '{regime.name}' ({mask.sum()} bars)")
         except Exception as e:
             LOG.error(
-                f"Failed to evaluate condition for regime '{regime.name}': {regime.condition}. Error: {e}"
+                f"Failed to evaluate regime '{regime.name}': {regime.condition}. Error: {e}"
             )
-            # Add a column of False to prevent downstream errors
             df[col_name] = False
     return df
 
@@ -1271,7 +1283,7 @@ class EpisodeDetector:
 ##############################################################################
 
 
-def discover_zones(df: pd.DataFrame, config: EngineConfig) -> List[Zone]:
+def discover_zones(df: pd.DataFrame, config: EngineConfig, regime_name: str) -> List[Zone]:
     """Runs all zone discovery providers and returns a final list of merged zones."""
     all_candidate_zones = []
     for provider_name in config.zones.providers:
@@ -1332,7 +1344,7 @@ def discover_zones(df: pd.DataFrame, config: EngineConfig) -> List[Zone]:
         zones = sorted(significant_zones, key=lambda z: z.activation_time)
 
     final_zones = [
-        dataclasses.replace(zone, id=i + 1, is_significant=True)
+        dataclasses.replace(zone, id=i + 1, is_significant=True, regime=regime_name)
         for i, zone in enumerate(zones)
     ]
     LOG.info(f"Detected {len(final_zones)} final zones.")
@@ -1406,7 +1418,7 @@ def _run_single_analysis(
 ) -> Dict[str, Any]:
     """Run complete in-sample analysis pipeline for a single data slice."""
     LOG.info(f"--- Running analysis for regime: {regime_name} ---")
-    zones = discover_zones(df, config)
+    zones = discover_zones(df, config, regime_name)
     episodes = evaluate_episodes(df, zones, config)
     LOG.info(f"[{regime_name}] Detected {len(episodes)} episodes across {len(zones)} zones")
 
@@ -1852,7 +1864,13 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
     if episodes_df.empty:
         return
     LOG.info(f"[{regime_name}] Generating distribution plots in {out_dir}...")
-    plt.style.use("seaborn-v0_8-darkgrid")
+    try:
+        plt.style.use("seaborn-v0_8-darkgrid")
+    except Exception:
+        try:
+            plt.style.use("seaborn-darkgrid")
+        except Exception:
+            pass  # fall back to default
     episodes_df["outcome_str"] = episodes_df["outcome"].apply(
         lambda x: x.value if isinstance(x, Enum) else x
     )
@@ -1865,9 +1883,9 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
     plt.savefig(os.path.join(out_dir, f"dist_outcomes_{regime_name}.png"))
     plt.close()
     plt.figure(figsize=(10, 6))
-    episodes_df["bars_to_outcome"].hist(
-        bins=50, range=(0, episodes_df["bars_to_outcome"].quantile(0.99))
-    )
+    q = episodes_df["bars_to_outcome"].quantile(0.99)
+    q = float(q) if np.isfinite(q) and q > 0 else episodes_df["bars_to_outcome"].max()
+    episodes_df["bars_to_outcome"].hist(bins=50, range=(0, q))
     plt.title(f"Distribution of Bars to Outcome (Regime: {regime_name})")
     plt.xlabel("Number of Bars")
     plt.ylabel("Frequency")
@@ -1876,15 +1894,15 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
     plt.close()
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
-    episodes_df["max_favorable"].hist(
-        bins=50, color="g", range=(0, episodes_df["max_favorable"].quantile(0.99))
-    )
+    q_fav = episodes_df["max_favorable"].quantile(0.99)
+    q_fav = float(q_fav) if np.isfinite(q_fav) and q_fav > 0 else episodes_df["max_favorable"].max()
+    episodes_df["max_favorable"].hist(bins=50, color="g", range=(0, q_fav))
     plt.title("Max Favorable Excursion")
     plt.xlabel("Points")
     plt.subplot(1, 2, 2)
-    episodes_df["max_adverse"].hist(
-        bins=50, color="r", range=(0, episodes_df["max_adverse"].quantile(0.99))
-    )
+    q_adv = episodes_df["max_adverse"].quantile(0.99)
+    q_adv = float(q_adv) if np.isfinite(q_adv) and q_adv > 0 else episodes_df["max_adverse"].max()
+    episodes_df["max_adverse"].hist(bins=50, color="r", range=(0, q_adv))
     plt.title("Max Adverse Excursion")
     plt.xlabel("Points")
     plt.tight_layout()
@@ -2058,7 +2076,7 @@ def run_walk_forward_analysis(
         LOG.info(
             f"--- Processing slice {i+1}/{len(slices)}: Train {train_df['timestamp'].min().date()}->{train_df['timestamp'].max().date()}, Test {test_df['timestamp'].min().date()}->{test_df['timestamp'].max().date()} ---"
         )
-        zones = discover_zones(train_df, config)
+        zones = discover_zones(train_df, config, "training")
         if not zones:
             LOG.warning("No zones discovered in training period. Skipping slice.")
             continue
@@ -2290,9 +2308,6 @@ def build_parser() -> argparse.ArgumentParser:
 from multiprocessing import Pool
 
 
-from multiprocessing import Pool, Manager
-
-
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2415,30 +2430,30 @@ def main():
                     return
 
                 wf_results = run_walk_forward_analysis(df, config, wf_config)
-                if wf_results:
+                if wf_results and "all_data" in wf_results:
+                    # Simplified handling for walk-forward with regimes
+                    # We report the aggregate of all OOS episodes regardless of regime
+                    agg_results = wf_results["all_data"]
                     with open(f"{args.out}/statistics_walkforward.json", "w") as f:
                         json.dump(
-                            wf_results["aggregated_statistics"],
-                            f,
-                            indent=2,
-                            default=str,
+                            agg_results["aggregated_statistics"], f, indent=2, default=str
                         )
-                    pd.DataFrame(wf_results["all_oos_episodes"]).to_csv(
+                    pd.DataFrame(agg_results["all_oos_episodes"]).to_csv(
                         f"{args.out}/episodes_walkforward.csv", index=False
                     )
                     if persistence and run_pk:
                         persistence.insert_statistics(
                             run_pk,
                             {
-                                "aggregated_walkforward": wf_results[
-                                    "aggregated_statistics"
-                                ]
+                                "aggregated_walkforward": agg_results[
+                                     "aggregated_statistics"
+                                 ]
                             },
                         )
                         persistence.insert_episodes(
-                            run_pk, wf_results["all_oos_episodes"]
+                            run_pk, agg_results["all_oos_episodes"]
                         )
-                    agg_stats = wf_results["aggregated_statistics"]
+                    agg_stats = agg_results["aggregated_statistics"]
                     if agg_stats["n_episodes"] > 0:
                         respect_rate = agg_stats["outcome_rates"].get("RESPECT", 0.0)
                         ci = agg_stats["outcome_rates_ci"].get("RESPECT", (None, None))
@@ -2514,8 +2529,9 @@ def main():
                 )
 
             config_dict = dataclasses.asdict(config)
+            db_path = args.db if args.db else None
             task_args = [
-                (params, config_dict, df, base_metadata, persistence)
+                (params, config_dict, df, base_metadata, db_path)
                 for params in param_grid
             ]
 
@@ -2559,46 +2575,40 @@ def main():
 
 # Top-level function for multiprocessing sweep
 def run_sweep_item(args_tuple):
-    params, config_dict, data_df, base_metadata, persistence = args_tuple
-    # Must reconstruct the config object in the new process
+    params, config_dict, data_df, base_metadata, db_path = args_tuple
+
     run_config = EngineConfig()
     update_dataclass_from_dict(run_config, config_dict)
     update_dataclass_from_dict(run_config, params)
 
-    if persistence:
-        sweep_metadata = base_metadata.copy()
-        sweep_metadata.update(
-            {
+    persistence = SQLitePersistence(db_path) if db_path else None
+    try:
+        if persistence:
+            sweep_metadata = base_metadata.copy()
+            sweep_metadata.update({
                 "run_uuid": str(uuid.uuid4()),
                 "command": "sweep_item",
                 "config": dataclasses.asdict(run_config),
-            }
-        )
-        run_pk = persistence.insert_run(sweep_metadata)
-    else:
-        run_pk = None
+            })
+            run_pk = persistence.insert_run(sweep_metadata)
+        else:
+            run_pk = None
 
-    # Sweep runs on all_data only
-    results = _run_single_analysis(data_df.copy(), run_config)
+        results = _run_single_analysis(data_df.copy(), run_config)
 
-    if persistence and run_pk:
-        persistence.insert_zones(run_pk, results["zones"])
-        persistence.insert_episodes(run_pk, results["episodes"])
-        persistence.insert_statistics(run_pk, results["statistics"])
+        if persistence and run_pk:
+            persistence.insert_zones(run_pk, results["zones"])
+            persistence.insert_episodes(run_pk, results["episodes"])
+            persistence.insert_statistics(run_pk, results["statistics"])
 
-    all_stats = results["statistics"].get("all", {})
-    summary_row = {
-        "params": json.dumps(params),
-        "n_valid_episodes": all_stats.get("n_episodes", 0),
-    }
-    if all_stats.get("n_episodes", 0) > 0:
-        summary_row.update(
-            {
-                f"{k.lower()}_rate": v
-                for k, v in all_stats.get("outcome_rates", {}).items()
-            }
-        )
-    return summary_row
+        all_stats = results["statistics"].get("all", {})
+        summary_row = {"params": json.dumps(params), "n_valid_episodes": all_stats.get("n_episodes", 0)}
+        if all_stats.get("n_episodes", 0) > 0:
+            summary_row.update({f"{k.lower()}_rate": v for k, v in all_stats.get("outcome_rates", {}).items()})
+        return summary_row
+    finally:
+        if persistence:
+            persistence.close()
 
 
 ##############################################################################
