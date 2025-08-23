@@ -1411,7 +1411,7 @@ def evaluate_episodes(
         }
         zone_episodes, touch_number = [], 0
         potential_indices = df.index[df["timestamp"] > zone.activation_time]
-        if not potential_indices.any():
+        if potential_indices.size == 0:
             continue
         current_scan_idx = int(potential_indices.min())
 
@@ -1620,13 +1620,15 @@ def compute_cvar(data: np.ndarray, alpha: float = 0.95) -> Optional[float]:
     """Computes Conditional Value at Risk (CVaR) at a given alpha level."""
     if len(data) == 0:
         return None
-    if len(data) < 30:
-        top_5_pct_idx = int(np.ceil(len(data) * 0.95))
-        return float(np.mean(np.sort(data)[top_5_pct_idx:]))
-
-    var = np.percentile(data, alpha * 100)
-    cvar = data[data > var].mean()
-    return float(cvar)
+    a = np.asarray(data)
+    if len(a) < 30:
+        a = np.sort(a)
+        k = max(0, int(np.floor(0.95 * len(a))))
+        # ensure at least one element in the tail
+        return float(a[k:].mean() if k < len(a) else a[-1])
+    var = np.percentile(a, alpha * 100)
+    tail = a[a > var]
+    return float(tail.mean() if tail.size else var)
 
 
 def compute_calibration_table(episodes: List[Dict]) -> List[Dict[str, Any]]:
@@ -2374,9 +2376,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-from multiprocessing import Pool
-
-
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2442,6 +2441,9 @@ def main():
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
         # File logging
+        for h in list(LOG.handlers):
+            if isinstance(h, logging.FileHandler):
+                LOG.removeHandler(h)
         fh = logging.FileHandler(os.path.join(out_dir, "log.txt"))
         fh.setFormatter(formatter)
         LOG.addHandler(fh)
@@ -2525,6 +2527,10 @@ def main():
                     with open(f"{args.out}/statistics_walkforward.json", "w") as f:
                         json.dump(
                             agg_results["aggregated_statistics"], f, indent=2, default=str
+                        )
+                    with open(f"{args.out}/statistics_walkforward_slices.json", "w") as f:
+                        json.dump(
+                            agg_results["per_slice_statistics"], f, indent=2, default=str
                         )
                     pd.DataFrame(agg_results["all_oos_episodes"]).to_csv(
                         f"{args.out}/episodes_walkforward.csv", index=False
