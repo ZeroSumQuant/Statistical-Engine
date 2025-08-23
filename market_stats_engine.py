@@ -721,7 +721,7 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
             else:
                 width = config.zone_width_points or 15.0
 
-            p_value = 1.0
+            p_value = 0.0
             if config.significance_test:
                 min_time, max_time = min(p['center_time'] for p in cluster), max(p['center_time'] for p in cluster)
                 sessions_spanned = df[(df['timestamp'] >= min_time) & (df['timestamp'] <= max_time)]['session_date'].unique()
@@ -752,19 +752,18 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
         else:
             significant_zones = candidate_zones
 
-        # Finalize zones with correct IDs
-        zones_this_type = []
-        for zone in significant_zones:
-            zones_this_type.append(dataclasses.replace(zone, id=zone_id, is_significant=True))
-            zone_id += 1
-
         # Merge close zones of the same type
-        if config.merge_tolerance_points > 0 and zones_this_type:
-            num_before_merge = len(zones_this_type)
-            zones_this_type = merge_close_zones(zones_this_type, config.merge_tolerance_points, config)
-            LOG.info(f"Merged {num_before_merge - len(zones_this_type)} {zone_type.value} zones.")
+        if config.merge_tolerance_points > 0 and significant_zones:
+            num_before_merge = len(significant_zones)
+            merged_zones = merge_close_zones(significant_zones, config.merge_tolerance_points, config)
+            LOG.info(f"Merged {num_before_merge - len(merged_zones)} {zone_type.value} zones.")
+        else:
+            merged_zones = significant_zones
 
-        final_zones.extend(zones_this_type)
+        # Finalize zones with correct, contiguous IDs
+        for zone in merged_zones:
+            final_zones.append(dataclasses.replace(zone, id=zone_id, is_significant=True))
+            zone_id += 1
 
     LOG.info(f"Detected {len(final_zones)} statistically significant zones after merging.")
     return final_zones
