@@ -1960,11 +1960,14 @@ def compute_statistics(
         }
 
     adverse_excursions = np.array(
-        [e["max_adverse"] for e in valid_episodes if "max_adverse" in e]
+        [e["max_adverse"] for e in valid_episodes
+         if ("max_adverse" in e and e["max_adverse"] is not None)],
+        dtype=float,
     )
-    if len(adverse_excursions) > 0:
+    adverse_excursions = adverse_excursions[np.isfinite(adverse_excursions)]
+    if adverse_excursions.size > 0:
         stats["tail_risk"]["cvar_95_adverse_excursion"] = compute_cvar(
-            adverse_excursions
+            adverse_excursions, alpha=0.95
         )
 
     stats["calibration"] = compute_calibration_table(valid_episodes)
@@ -2200,7 +2203,10 @@ def save_daily_maps(
     local_tz = df["local_time"].dt.tz or "UTC"
 
     def to_local_date(ts):
-        return pd.Timestamp(ts, tz="UTC").tz_convert(local_tz).date()
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        return t.tz_convert(local_tz).date()
 
     map_count = 0
     # Process sessions in reverse to get the most recent maps first
@@ -2567,7 +2573,8 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--config", help="Engine config file (YAML/JSON)")
     analyze_parser.add_argument("--out", default="results/", help="Output directory")
     analyze_parser.add_argument(
-        "--wf", help='Enable walk-forward validation. e.g., "window=90d,step=30d"'
+        "--wf",
+        help='Enable walk-forward validation. e.g., "window=90d,step=30d[,test=30d]"'
     )
     analyze_parser.add_argument(
         "--db", help="Path to SQLite database for results lineage."
@@ -2773,7 +2780,7 @@ def main():
                     if "window" not in wf_config or "step" not in wf_config:
                         raise ValueError("window and step required")
                 except Exception as e:
-                    LOG.error(f"Invalid --wf format: {e}. Use 'window=90d,step=30d'.")
+                    LOG.error(f"Invalid --wf format: {e}. Use 'window=90d,step=30d[,test=30d]'.")
                     return
 
                 wf_results = run_walk_forward_analysis(df, config, wf_config)
@@ -2833,19 +2840,27 @@ def main():
                     for cohort, stats in results["statistics"].items():
                         all_stats_flat[f"{regime_name}_{cohort}"] = stats
 
-                pd.DataFrame([dataclasses.asdict(z) for z in all_zones]).to_csv(f"{args.out}/zones.csv", index=False)
+                zones_df = pd.DataFrame([dataclasses.asdict(z) for z in all_zones])
+                if not zones_df.empty:
+                    zones_df["type"] = zones_df["type"].apply(lambda x: x.value if isinstance(x, Enum) else x)
+                    zones_df["activation_time"] = pd.to_datetime(zones_df["activation_time"])
+                zones_df.to_csv(f"{args.out}/zones.csv", index=False)
+
                 episodes_df = pd.DataFrame(all_episodes).copy()
-                for col in ("outcome", "zone_type"):
-                    if col in episodes_df.columns:
-                        episodes_df[col] = episodes_df[col].apply(lambda x: x.value if isinstance(x, Enum) else x)
-                for col in ("touch_time", "outcome_time"):
-                    if col in episodes_df.columns:
-                        episodes_df[col] = pd.to_datetime(episodes_df[col])
+                if not episodes_df.empty:
+                    for col in ("outcome", "zone_type"):
+                        if col in episodes_df.columns:
+                            episodes_df[col] = episodes_df[col].apply(lambda x: x.value if isinstance(x, Enum) else x)
+                    for col in ("touch_time", "outcome_time"):
+                        if col in episodes_df.columns:
+                            episodes_df[col] = pd.to_datetime(episodes_df[col])
 
                 episodes_df.to_csv(f"{args.out}/episodes.csv", index=False)
                 if HAVE_PARQUET:
-                    episodes_df.to_parquet(f"{args.out}/episodes.parquet", index=False)
-                    pd.DataFrame([dataclasses.asdict(z) for z in all_zones]).to_parquet(f"{args.out}/zones.parquet", index=False)
+                    if not episodes_df.empty:
+                        episodes_df.to_parquet(f"{args.out}/episodes.parquet", index=False)
+                    if not zones_df.empty:
+                        zones_df.to_parquet(f"{args.out}/zones.parquet", index=False)
                 with open(f"{args.out}/statistics.json", "w") as f:
                     json.dump(all_stats_flat, f, indent=2, default=str)
 
