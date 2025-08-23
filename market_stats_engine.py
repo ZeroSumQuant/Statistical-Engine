@@ -377,6 +377,7 @@ class EngineConfig:
     cache_dir: str = "cache"
     out_dir: str = "runs/run_latest"
     random_seed: Optional[int] = 42
+    bootstrap_block_size: Optional[int] = None
 
 
 @dataclass
@@ -402,7 +403,7 @@ def test_zone_significance(
     touches: List[float],
     level: float,
     width: float,
-    local_prices: pd.Series,
+    local_prices_df: pd.DataFrame,
     alpha: float = ZONE_SIGNIFICANCE_ALPHA,
 ) -> Tuple[bool, float]:
     """
@@ -413,7 +414,10 @@ def test_zone_significance(
     if n < 2:
         return True, 1.0  # Not enough data to test, default to significant
 
-    window_pts = local_prices.max() - local_prices.min()
+    if local_prices_df.empty:
+        return True, 1.0
+
+    window_pts = float(local_prices_df["high"].max() - local_prices_df["low"].min())
     if window_pts <= 0:
         return True, 1.0  # Cannot determine p0, default to significant
 
@@ -454,8 +458,8 @@ except Exception:
 def block_bootstrap_ci(
     data: np.ndarray,
     statistic_func,
+    block_size: int,
     n_boot: int = 5000,
-    block_size: int = BOOTSTRAP_BLOCK_SIZE,
     alpha: float = 0.05,
     seed: Optional[int] = None,
 ) -> Tuple[float, float]:
@@ -482,8 +486,8 @@ def block_bootstrap_ci(
 
 def block_bootstrap_prop_ci(
     x: np.ndarray,  # 0/1 vector
+    block_size: int,
     n_boot: int = 4000,
-    block_size: int = BOOTSTRAP_BLOCK_SIZE,
     alpha: float = 0.05,
     seed: Optional[int] = None,
 ) -> Tuple[float, float]:
@@ -514,6 +518,62 @@ def block_bootstrap_prop_ci(
     lo = stats[int(np.floor((alpha/2) * len(stats)))]
     hi = stats[int(np.floor((1 - alpha/2) * len(stats)))]
     return float(lo), float(hi)
+
+
+def bootstrap_risk_difference(
+    x1: np.ndarray,  # 0/1 vector for cohort
+    x2: np.ndarray,  # 0/1 vector for baseline
+    block_size: int,
+    n_boot: int = 3000,
+    alpha: float = 0.05,
+    seed: Optional[int] = None,
+) -> Tuple[float, Tuple[float, float], float]:
+    """
+    Computes CI and p-value for risk difference (p1 - p2) via block bootstrap.
+    Handles autocorrelation by preserving the sample's block structure.
+    Returns: (observed difference, (CI low, CI high), p-value)
+    """
+    rng = np.random.default_rng(seed)
+    obs_diff = x1.mean() - x2.mean()
+
+    n1, n2 = len(x1), len(x2)
+    if n1 < block_size or n2 < block_size:
+        # Fallback to standard bootstrap if data is too small for blocks
+        boot_diffs = []
+        for _ in range(n_boot):
+            mean1 = rng.choice(x1, size=n1, replace=True).mean()
+            mean2 = rng.choice(x2, size=n2, replace=True).mean()
+            boot_diffs.append(mean1 - mean2)
+    else:
+        # Generate bootstrap samples of the *difference* using moving blocks
+        boot_diffs = []
+        z1 = np.concatenate([x1, x1[: block_size - 1]])
+        z2 = np.concatenate([x2, x2[: block_size - 1]])
+
+        for _ in range(n_boot):
+            nb1 = math.ceil(n1 / block_size)
+            starts1 = rng.integers(0, n1, size=nb1)
+            idx1 = np.concatenate([np.arange(s, s + block_size) for s in starts1])[:n1]
+            mean1 = z1[idx1].mean()
+
+            nb2 = math.ceil(n2 / block_size)
+            starts2 = rng.integers(0, n2, size=nb2)
+            idx2 = np.concatenate([np.arange(s, s + block_size) for s in starts2])[:n2]
+            mean2 = z2[idx2].mean()
+
+            boot_diffs.append(mean1 - mean2)
+
+    boot_diffs = np.array(boot_diffs)
+
+    # Percentile CI
+    ci_lo = np.percentile(boot_diffs, 100 * alpha / 2)
+    ci_hi = np.percentile(boot_diffs, 100 * (1 - alpha / 2))
+
+    # Two-sided p-value from bootstrap distribution shifted to satisfy H0
+    boot_diffs_h0 = boot_diffs - obs_diff
+    p_value = (np.abs(boot_diffs_h0) >= np.abs(obs_diff)).mean()
+
+    return obs_diff, (float(ci_lo), float(ci_hi)), float(p_value)
 
 
 def standard_bootstrap_ci(
@@ -928,7 +988,7 @@ def detect_zones_from_pivots(
                         touches,
                         level,
                         width_for_test,
-                        pd.concat([local_prices_df["high"], local_prices_df["low"]]),
+                        local_prices_df,
                     )
 
             activation_time = (
@@ -1018,7 +1078,7 @@ def detect_zones_from_csv(
                     touches,
                     level,
                     width_for_test,
-                    pd.concat([local_prices_df["high"], local_prices_df["low"]]),
+                    local_prices_df,
                 )
 
         candidate_zones.append(
@@ -1533,6 +1593,78 @@ def _run_single_analysis(
             for name, data in strata.items()
             if not data.empty
         }
+
+        # --- Add cohort comparisons vs baseline ---
+        baseline_episodes_df = strata.get("all")
+        if baseline_episodes_df is not None and not baseline_episodes_df.empty:
+            baseline_outcomes = (
+                baseline_episodes_df["outcome"]
+                .apply(
+                    lambda o: (o.value if isinstance(o, Enum) else o)
+                    == EpisodeOutcome.RESPECT.value
+                )
+                .values
+            )
+
+            p_values = []
+            cohort_names_for_correction = []
+
+            for name, cohort_df in strata.items():
+                if (
+                    name == "all"
+                    or cohort_df.empty
+                    or len(cohort_df) < MIN_EPISODES_FOR_STATS
+                ):
+                    continue
+
+                cohort_outcomes = (
+                    cohort_df["outcome"]
+                    .apply(
+                        lambda o: (o.value if isinstance(o, Enum) else o)
+                        == EpisodeOutcome.RESPECT.value
+                    )
+                    .values
+                )
+
+                block_size = (
+                    config.bootstrap_block_size
+                    if config.bootstrap_block_size is not None
+                    else (config.episode.T // 2 or 5)
+                )
+
+                try:
+                    risk_diff, ci, p_val = bootstrap_risk_difference(
+                        cohort_outcomes,
+                        baseline_outcomes,
+                        block_size=block_size,
+                        seed=config.random_seed,
+                    )
+
+                    stratified_stats[name]["comparative_respect_rate"] = {
+                        "risk_difference": risk_diff,
+                        "risk_difference_ci": ci,
+                        "p_value": p_val,
+                    }
+                    p_values.append(p_val)
+                    cohort_names_for_correction.append(name)
+                except Exception as e:
+                    LOG.warning(f"Could not run cohort comparison for '{name}': {e}")
+
+            if HAVE_STATSMODELS and p_values:
+                try:
+                    reject, q_values, _, _ = multipletests(
+                        p_values, alpha=ZONE_SIGNIFICANCE_ALPHA, method="fdr_bh"
+                    )
+                    for i, name in enumerate(cohort_names_for_correction):
+                        if "comparative_respect_rate" in stratified_stats[name]:
+                            stratified_stats[name]["comparative_respect_rate"][
+                                "q_value"
+                            ] = q_values[i]
+                            stratified_stats[name]["comparative_respect_rate"][
+                                "reject_h0"
+                            ] = bool(reject[i])
+                except Exception as e:
+                    LOG.error(f"Failed to run multiple comparisons correction: {e}")
     else:
         stratified_stats = {"all": compute_statistics([], config)}
 
@@ -1716,11 +1848,34 @@ def compute_statistics(
         )
 
     # Dependence-aware CIs for outcome rates via block bootstrap
+    block_size = (
+        config.bootstrap_block_size
+        if config.bootstrap_block_size is not None
+        else (max(5, config.episode.T // 2))
+    )
     for outcome_str, rate in stats["outcome_rates"].items():
-        y = np.array([(1 if (e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"]) == outcome_str else 0)
-                      for e in valid_episodes], dtype=float)
+        y = np.array(
+            [
+                (
+                    1
+                    if (
+                        e["outcome"].value
+                        if isinstance(e["outcome"], Enum)
+                        else e["outcome"]
+                    )
+                    == outcome_str
+                    else 0
+                )
+                for e in valid_episodes
+            ],
+            dtype=float,
+        )
         stats["outcome_rates_ci"][outcome_str] = block_bootstrap_prop_ci(
-            y, n_boot=3000, block_size=max(5, config.episode.T // 2), alpha=alpha, seed=config.random_seed
+            y,
+            n_boot=3000,
+            block_size=block_size,
+            alpha=alpha,
+            seed=config.random_seed,
         )
 
     for metric_name in ["bars_to_outcome", "max_favorable", "max_adverse"]:
@@ -1728,7 +1883,6 @@ def compute_statistics(
             [e[metric_name] for e in valid_episodes if e.get(metric_name) is not None]
         )
         if len(data) > 1:
-            block_size = config.episode.T // 2 or 5
             stats["bootstrapped_metrics"][metric_name] = {
                 "mean": np.mean(data),
                 "median": np.median(data),
@@ -2227,6 +2381,40 @@ def save_cohort_lift_plot(statistics: Dict[str, Any], out_dir: str, regime_name:
     plt.close()
 
 
+def generate_summary_csv(all_results: Dict[str, Any], out_dir: str):
+    """Generates a summary CSV of key metrics for all regimes."""
+    summary_data = []
+    for regime_name, results in all_results.items():
+        stats = results.get("statistics", {}).get("all", {})
+        if not stats or stats.get("n_episodes", 0) == 0:
+            continue
+
+        respect_rate_ci = stats.get("outcome_rates_ci", {}).get("RESPECT", (np.nan, np.nan))
+        if not respect_rate_ci or len(respect_rate_ci) != 2:
+            respect_rate_ci = (np.nan, np.nan)
+
+        row = {
+            "regime": regime_name,
+            "n_episodes": stats.get("n_episodes"),
+            "respect_rate": stats.get("outcome_rates", {}).get("RESPECT"),
+            "respect_rate_ci_low": respect_rate_ci[0],
+            "respect_rate_ci_high": respect_rate_ci[1],
+            "median_bars_to_outcome": stats.get("survival_analysis", {}).get(
+                "median_bars_to_outcome"
+            ),
+            "cvar_95_adverse_excursion": stats.get("tail_risk", {}).get(
+                "cvar_95_adverse_excursion"
+            ),
+        }
+        summary_data.append(row)
+
+    if summary_data:
+        summary_df = pd.DataFrame(summary_data)
+        out_path = os.path.join(out_dir, "summary.csv")
+        summary_df.to_csv(out_path, index=False, float_format="%.4f")
+        LOG.info(f"Saved summary stats to {out_path}")
+
+
 def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: EngineConfig):
     """Generates a single-file HTML report with embedded images."""
 
@@ -2274,10 +2462,10 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
             </table>
 
             <h3>Outcome Distributions</h3>
-            {embed_img(os.path.join(out_dir, f'dist_outcomes_{regime_name}.png'))}
+            {embed_img(os.path.join(out_dir, "charts", f'dist_outcomes_{regime_name}.png'))}
 
             <h3>Top Cohorts by Lift</h3>
-            {embed_img(os.path.join(out_dir, f'plot_cohort_lift_{regime_name}.png'))}
+            {embed_img(os.path.join(out_dir, "charts", f'plot_cohort_lift_{regime_name}.png'))}
 
             <h3>Calibration</h3>
             <table>
@@ -2348,6 +2536,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument(
         "--regimes", help="Path to YAML file defining market regimes."
     )
+    analyze_parser.add_argument(
+        "--block-size", type=int, help="Override for bootstrap block size."
+    )
 
     # --- Sweep Command ---
     sweep_parser = subparsers.add_parser("sweep", help="Parameter sweep")
@@ -2388,6 +2579,9 @@ def main():
     if hasattr(args, "seed") and args.seed is not None:
         config.random_seed = args.seed
         LOG.info(f"Using random seed: {config.random_seed}")
+    if hasattr(args, "block_size") and args.block_size is not None:
+        config.bootstrap_block_size = args.block_size
+        LOG.info(f"Using manual bootstrap block size: {config.bootstrap_block_size}")
 
     # Deterministic RNG
     if config.random_seed is not None:
@@ -2594,13 +2788,34 @@ def main():
                         )
 
                 # Plotting for each regime
+                charts_dir = os.path.join(args.out, "charts")
+                Path(charts_dir).mkdir(parents=True, exist_ok=True)
                 for regime_name, results in all_results.items():
                     plot_episodes_df = pd.DataFrame(results["episodes"])
-                    if plot_episodes_df.empty: continue
+                    if plot_episodes_df.empty:
+                        continue
 
-                    save_distribution_plots(plot_episodes_df, args.out, regime_name)
-                    save_daily_maps(df, results["zones"], results["episodes"], args.out, regime_name)
-                    save_cohort_lift_plot(results["statistics"], args.out, regime_name)
+                    save_distribution_plots(plot_episodes_df, charts_dir, regime_name)
+                    save_daily_maps(
+                        df, results["zones"], results["episodes"], charts_dir, regime_name
+                    )
+                    save_cohort_lift_plot(
+                        results["statistics"], charts_dir, regime_name
+                    )
+
+                # --- Final Artifacts ---
+                generate_summary_csv(all_results, args.out)
+
+                if HAVE_YAML:
+                    config_path = os.path.join(args.out, "config.yaml")
+                    try:
+                        with open(config_path, "w") as f:
+                            yaml.dump(
+                                dataclasses.asdict(config), f, default_flow_style=False
+                            )
+                        LOG.info(f"Saved config snapshot to {config_path}")
+                    except Exception as e:
+                        LOG.error(f"Could not save config snapshot: {e}")
 
                 if args.report:
                     LOG.info("Generating HTML report...")
@@ -2685,6 +2900,12 @@ def run_sweep_item(args_tuple):
     run_config = EngineConfig()
     update_dataclass_from_dict(run_config, config_dict)
     update_dataclass_from_dict(run_config, params)
+
+    # Derive a deterministic, unique seed for this sweep item to ensure reproducibility
+    base_seed = run_config.random_seed or 0
+    param_hash = hash(json.dumps(params, sort_keys=True))
+    item_seed = (base_seed ^ param_hash) & 0xFFFFFFFF
+    run_config.random_seed = item_seed
 
     persistence = SQLitePersistence(db_path) if db_path else None
     try:
