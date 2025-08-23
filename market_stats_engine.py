@@ -383,6 +383,14 @@ try:
 except ImportError:
     tqdm = None # type: ignore
 
+# Multiprocessing guard
+try:
+    from multiprocessing import Pool
+    HAVE_MULTIPROCESSING = True
+except Exception:
+    Pool = None  # type: ignore
+    HAVE_MULTIPROCESSING = False
+
 def block_bootstrap_ci(data: np.ndarray, statistic_func, n_boot: int = 5000,
                        block_size: int = BOOTSTRAP_BLOCK_SIZE, alpha: float = 0.05, seed: Optional[int] = None) -> Tuple[float, float]:
     """Circular moving block bootstrap for confidence intervals."""
@@ -426,6 +434,11 @@ def update_dataclass_from_dict(dc, d: Dict):
             update_dataclass_from_dict(field_value, v)
         else:
             setattr(dc, k, v)
+
+def round_to_tick(x: float, tick: float) -> float:
+    """Rounds a price to the nearest instrument tick size."""
+    if tick == 0: return x
+    return round(round(x / tick) * tick, 10)
 
 def _ensure_utc_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     """Ensures the timestamp column is a timezone-aware UTC timestamp."""
@@ -620,21 +633,26 @@ def detect_zones_from_pivots(df: pd.DataFrame, config: ZoneConfig, instrument: I
     """Detects candidate zones from price pivots."""
     pivots = detect_pivots(df, config.pivot_k, config, instrument)
     candidate_zones = []
+    tick_size = instrument.tick_size
 
-    for pivot_list, zone_type in [(p for p in pivots if p["type"] == "HIGH"), ZoneType.RESISTANCE], [(p for p in pivots if p["type"] == "LOW"), ZoneType.SUPPORT]:
-        clusters = cluster_pivots(list(pivot_list), config)
+    high_pivots = [p for p in pivots if p["type"] == "HIGH"]
+    low_pivots  = [p for p in pivots if p["type"] == "LOW"]
+
+    for pivot_list, zone_type in [(high_pivots, ZoneType.RESISTANCE),
+                                  (low_pivots, ZoneType.SUPPORT)]:
+        clusters = cluster_pivots(pivot_list, config)
         for cluster in clusters:
             if len(cluster) < config.min_touches_for_significance: continue
             touches = [p["price"] for p in cluster]
-            level = np.mean(touches)
+            level = round_to_tick(np.mean(touches), tick_size)
 
             if config.zone_width_alpha_atr is not None:
                 t0, t1 = min(p["center_time"] for p in cluster), max(p["center_time"] for p in cluster)
                 local_df = df[(df["timestamp"] >= t0) & (df["timestamp"] <= t1)]
                 atr_ref = float(local_df["atr"].median() if not local_df.empty and not local_df["atr"].isnull().all() else float(df["atr"].median()))
-                width = max(1e-9, config.zone_width_alpha_atr * atr_ref)
+                width = max(tick_size, round_to_tick(config.zone_width_alpha_atr * atr_ref, tick_size))
             else:
-                width = config.zone_width_points or 15.0
+                width = max(tick_size, round_to_tick(config.zone_width_points or 15.0, tick_size))
 
             p_value = 1.0
             if config.significance_test:
@@ -1017,14 +1035,22 @@ def compute_statistics(episodes: List[Dict], config: EngineConfig, alpha: float 
         stats["outcome_distribution"][outcome.value] = int(count)
         stats["outcome_rates"][outcome.value] = count / n_episodes if n_episodes > 0 else 0
 
-    if n_episodes < MIN_EPISODES_FOR_STATS: return stats
-
-    for outcome_str, rate in stats["outcome_rates"].items():
-        if HAVE_SCIPY:
-            from scipy.stats import beta
+    if n_episodes >= MIN_EPISODES_FOR_STATS and HAVE_SCIPY:
+        from scipy.stats import beta
+        for outcome_str, rate in stats["outcome_rates"].items():
             k = stats["outcome_distribution"][outcome_str]
-            ci = beta.interval(1-alpha, k+0.5, n_episodes-k+0.5) if k > 0 and k < n_episodes else (0,0)
-            stats["outcome_rates_ci"][outcome_str] = (ci[0], ci[1])
+            n = n_episodes
+            if n > 0:
+                if k == 0:
+                    ci_low = 0.0
+                    ci_high = beta.ppf(1 - alpha/2, 0.5, n + 0.5)
+                elif k == n:
+                    ci_low = beta.ppf(alpha/2, n + 0.5, 0.5)
+                    ci_high = 1.0
+                else:
+                    ci_low = beta.ppf(alpha/2, k + 0.5, n - k + 0.5)
+                    ci_high = beta.ppf(1 - alpha/2, k + 0.5, n - k + 0.5)
+                stats["outcome_rates_ci"][outcome_str] = (ci_low, ci_high)
 
     for metric_name in ["bars_to_outcome", "max_favorable", "max_adverse"]:
         data = np.array([e[metric_name] for e in valid_episodes if e.get(metric_name) is not None])
@@ -1169,7 +1195,11 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
             for _, episode in day_episodes.iterrows():
                 outcome_str = episode['outcome'].value if isinstance(episode['outcome'], Enum) else episode['outcome']
                 outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(outcome_str, 'grey')
-                touch_price = df.iloc[df['timestamp'].searchsorted(episode['touch_time'])]['close']
+                ix = df['timestamp'].searchsorted(episode['touch_time'])
+                ix = int(np.clip(ix, 1, len(df) - 1))
+                cand = df.iloc[[ix - 1, ix]]
+                row = cand.iloc[(cand["timestamp"] - episode['touch_time']).abs().values.argmin()]
+                touch_price = row["close"]
                 ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
                 ax.text(episode['outcome_time'], touch_price, f"{outcome_str} (T{episode['touch_number']})", color=outcome_color, fontsize=9)
         ax.set_title(f"Market Map for {session.strftime('%Y-%m-%d')}"); ax.set_ylabel("Price"); ax.grid(True, linestyle='--', alpha=0.5); fig.autofmt_xdate(); plt.tight_layout(); plt.savefig(os.path.join(maps_dir, f"map_{session.strftime('%Y-%m-%d')}.png")); plt.close(fig)
@@ -1415,14 +1445,14 @@ def main():
         base_metadata = {
             "run_uuid": str(uuid.uuid4()), "run_timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "command": args.command, "args": vars(args), "code_sha256": get_file_sha256(__file__),
-            "data_sha256": {f: get_file_sha256(f) for f in (args.files if hasattr(args, 'files') else (getattr(args, 'data', None) and [args.data])) if f},
+            "data_sha256": {f: get_file_sha256(f) for f in (args.files if hasattr(args, 'files') and args.files else (getattr(args, 'data', None) and [args.data])) if f},
             "config": dataclasses.asdict(config)
         }
         with open(os.path.join(out_dir, "run_metadata.json"), "w") as f: json.dump(base_metadata, f, indent=2, default=str)
         LOG.info(f"Saved run metadata to {os.path.join(out_dir, 'run_metadata.json')}")
 
         if args.command == "prepare":
-            df_iter = tqdm(args.files, desc="Preparing files") if tqdm else args.files
+            df_iter = tqdm(args.files, desc="Preparing files") if tqdm and args.files else args.files
             df = prepare_data(df_iter, config)
             out_path = args.out
             if out_path.endswith(".parquet"):
@@ -1496,6 +1526,7 @@ def main():
             config_dict = dataclasses.asdict(config)
             task_args = [(params, config_dict, df, base_metadata, persistence) for params in param_grid]
 
+            summary_results = []
             if args.jobs > 1 and HAVE_MULTIPROCESSING:
                 LOG.info(f"Starting parallel sweep with {args.jobs} jobs.")
                 with Pool(args.jobs) as pool:
@@ -1522,13 +1553,26 @@ def main():
 
 # Top-level function for multiprocessing sweep
 def run_sweep_item(args_tuple):
-    params, config_dict, data_df = args_tuple
+    params, config_dict, data_df, base_metadata, persistence = args_tuple
     # Must reconstruct the config object in the new process
     run_config = EngineConfig()
     update_dataclass_from_dict(run_config, config_dict)
     update_dataclass_from_dict(run_config, params)
 
+    if persistence:
+        sweep_metadata = base_metadata.copy()
+        sweep_metadata.update({"run_uuid": str(uuid.uuid4()), "command": "sweep_item", "config": dataclasses.asdict(run_config)})
+        run_pk = persistence.insert_run(sweep_metadata)
+    else:
+        run_pk = None
+
     results = run_analysis(data_df.copy(), run_config)
+
+    if persistence and run_pk:
+        persistence.insert_zones(run_pk, results['zones'])
+        persistence.insert_episodes(run_pk, results['episodes'])
+        persistence.insert_statistics(run_pk, results['statistics'])
+
     all_stats = results["statistics"].get("all", {})
     summary_row = {"params": json.dumps(params), "n_valid_episodes": all_stats.get("n_episodes", 0)}
     if all_stats.get("n_episodes", 0) > 0:
