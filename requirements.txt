@@ -1,0 +1,10 @@
+numpy
+pandas
+polars
+pyarrow
+scipy
+pyyaml
+statsmodels
+pytz
+matplotlib
+tqdm

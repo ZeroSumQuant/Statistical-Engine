@@ -1618,6 +1618,7 @@ def _run_single_analysis(
 
             p_values = []
             cohort_names_for_correction = []
+            skipped_cohort_count = 0
 
             # Helper for effect sizes
             eps = 1e-6
@@ -1628,11 +1629,12 @@ def _run_single_analysis(
                 return 2 * (math.asin(math.sqrt(p)) - math.asin(math.sqrt(q)))
 
             for name, cohort_df in strata.items():
-                if (
-                    name == "all"
-                    or cohort_df.empty
-                    or len(cohort_df) < MIN_EPISODES_FOR_STATS
-                ):
+                if name == "all" or cohort_df.empty:
+                    continue
+
+                if len(cohort_df) < MIN_EPISODES_FOR_STATS:
+                    LOG.debug(f"Skipping cohort '{name}' (n={len(cohort_df)} < {MIN_EPISODES_FOR_STATS}) for comparative stats.")
+                    skipped_cohort_count += 1
                     continue
 
                 cohort_outcomes = (
@@ -1693,6 +1695,9 @@ def _run_single_analysis(
                     LOG.error(f"Failed to run multiple comparisons correction: {e}")
     else:
         stratified_stats = {"all": compute_statistics([], config)}
+
+    if 'skipped_cohort_count' in locals() and skipped_cohort_count > 0:
+        LOG.info(f"Skipped {skipped_cohort_count} cohorts with n < {MIN_EPISODES_FOR_STATS} for comparative stats.")
 
     return {
         "zones": zones,
@@ -2139,8 +2144,16 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
             plt.style.use("seaborn-darkgrid")
         except Exception:
             pass  # fall back to default
+
+    outcome_labels = {
+        "RESPECT": "Respect",
+        "PIERCE_AND_REVERT": "Pierce -> Revert",
+        "BREAK": "Break",
+        "TIMEOUT": "Timeout",
+        "INVALID": "Invalid",
+    }
     episodes_df["outcome_str"] = episodes_df["outcome"].apply(
-        lambda x: x.value if isinstance(x, Enum) else x
+        lambda x: outcome_labels.get(x.value if isinstance(x, Enum) else x, x)
     )
     plt.figure(figsize=(10, 6))
     episodes_df["outcome_str"].value_counts().plot(kind="bar")
@@ -2150,29 +2163,31 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"dist_outcomes_{regime_name}.png"))
     plt.close()
+
     plt.figure(figsize=(10, 6))
     q = episodes_df["bars_to_outcome"].quantile(0.99)
     q = float(q) if np.isfinite(q) and q > 0 else episodes_df["bars_to_outcome"].max()
     episodes_df["bars_to_outcome"].hist(bins=50, range=(0, q))
     plt.title(f"Distribution of Bars to Outcome (Regime: {regime_name})")
-    plt.xlabel("Number of Bars")
+    plt.xlabel("Number of Bars to Outcome (bars)")
     plt.ylabel("Frequency")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"dist_bars_to_outcome_{regime_name}.png"))
     plt.close()
+
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
     q_fav = episodes_df["max_favorable"].quantile(0.99)
     q_fav = float(q_fav) if np.isfinite(q_fav) and q_fav > 0 else episodes_df["max_favorable"].max()
-    episodes_df["max_favorable"].hist(bins=50, color="g", range=(0, q_fav))
+    episodes_df["max_favorable"].hist(bins=50, color="C2", range=(0, q_fav))
     plt.title("Max Favorable Excursion")
-    plt.xlabel("Points")
+    plt.xlabel("Excursion (points)")
     plt.subplot(1, 2, 2)
     q_adv = episodes_df["max_adverse"].quantile(0.99)
     q_adv = float(q_adv) if np.isfinite(q_adv) and q_adv > 0 else episodes_df["max_adverse"].max()
-    episodes_df["max_adverse"].hist(bins=50, color="r", range=(0, q_adv))
+    episodes_df["max_adverse"].hist(bins=50, color="C3", range=(0, q_adv))
     plt.title("Max Adverse Excursion")
-    plt.xlabel("Points")
+    plt.xlabel("Excursion (points)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"dist_excursions_{regime_name}.png"))
     plt.close()
@@ -2210,7 +2225,7 @@ def save_daily_maps(
     # Process sessions in reverse to get the most recent maps first
     for session, day_df in sorted(df.groupby("session_date"), key=lambda x: x[0], reverse=True):
         if map_count >= max_maps:
-            LOG.info(f"Reached max_maps limit ({max_maps}), stopping map generation.")
+            LOG.info(f"Generated {map_count} of {max_maps} maps. Use --max-maps to generate more.")
             break
         fig, ax = plt.subplots(figsize=(15, 8))
         ax.plot(
@@ -2228,14 +2243,15 @@ def save_daily_maps(
                     zone.activation_time + pd.Timedelta(days=zone.expire_days)
                 )
             ):
-                color = "green" if zone.type == ZoneType.SUPPORT else "red"
+                color = "C0" if zone.type == ZoneType.SUPPORT else "C1"
+                linestyle = "--" if zone.type == ZoneType.SUPPORT else "-."
                 ax.axhspan(
                     zone.level - zone.width,
                     zone.level + zone.width,
                     alpha=0.1,
                     color=color,
                 )
-                ax.axhline(zone.level, color=color, linestyle="--", linewidth=0.7)
+                ax.axhline(zone.level, color=color, linestyle=linestyle, linewidth=0.7)
         if not episodes_df.empty:
             day_episodes = episodes_df[episodes_df["touch_time"].dt.date == session]
             for _, episode in day_episodes.iterrows():
@@ -2434,13 +2450,30 @@ def save_cohort_lift_plot(statistics: Dict[str, Any], out_dir: str, regime_name:
 
     plt.figure(figsize=(10, 8))
     df["lift"].plot(
-        kind="barh", color=df["lift"].apply(lambda x: "g" if x > 0 else "r")
+        kind="barh", color=df["lift"].apply(lambda x: "C0" if x > 0 else "C1")
     )
     plt.title(f"Top 10 Cohorts by Respect Rate Lift (Regime: {regime_name})")
-    plt.xlabel("Lift over Baseline Respect Rate")
+    plt.xlabel("Lift over Baseline Respect Rate (pp)")
     plt.axvline(0, color="black", linestyle="--")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"plot_cohort_lift_{regime_name}.png"))
+    plt.close()
+
+
+def save_respect_rate_ci_plot(stats: Dict[str, Any], out_dir: str, regime: str):
+    s = stats.get("all", {})
+    rr = s.get("outcome_rates", {}).get("RESPECT")
+    ci = s.get("outcome_rates_ci", {}).get("RESPECT")
+    if rr is None or not ci or ci[0] is None: return
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(6,4))
+    plt.errorbar([0], [rr], yerr=[[max(0, rr - ci[0])], [max(0, ci[1] - rr)]], fmt="o", capsize=6)
+    plt.xticks([0], ["Respect rate"])
+    plt.ylim(0, 1)
+    plt.ylabel("Rate")
+    plt.title(f"Respect Rate ±95% CI (Regime: {regime})")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"respect_rate_ci_{regime}.png"))
     plt.close()
 
 
@@ -2454,6 +2487,9 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
             encoded = base64.b64encode(f.read()).decode("utf-8")
         return f'<img src="data:image/png;base64,{encoded}" alt="{os.path.basename(path)}" style="width:100%; max-width:600px;">'
 
+    def _fmt_ci_html(ci_tuple):
+        return "N/A" if not ci_tuple or ci_tuple[0] is None else f"{ci_tuple[0]:.2%} – {ci_tuple[1]:.2%}"
+
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -2464,14 +2500,18 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
             body {{ font-family: sans-serif; margin: 2em; }}
             h1, h2, h3 {{ color: #333; }}
             hr {{ margin: 2em 0; }}
-            table {{ border-collapse: collapse; width: 100%; max-width: 800px; margin-bottom: 2em; }}
+            table {{ border-collapse: collapse; width: 100%; max-width: 900px; margin-bottom: 2em; }}
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
             th {{ background-color: #f2f2f2; }}
+            .summary-table td {{ font-size: 1.1em; text-align: center; }}
+            .summary-table th {{ font-size: 0.9em; font-weight: normal; color: #666; }}
+            .footer {{ margin-top: 2em; font-size: 0.8em; color: #666; }}
         </style>
     </head>
     <body>
         <h1>Market Statistics Report: {config.instrument.symbol}</h1>
-"""
+        <p class="footer">Generated on {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    """
     # --- Add Method Notes ---
     num_tests = 0
     # Find the number of tests from the first regime that has them
@@ -2508,34 +2548,109 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         if not all_stats:
             continue
 
+        rr = all_stats.get("outcome_rates", {}).get("RESPECT", float('nan'))
+        ci = all_stats.get("outcome_rates_ci", {}).get("RESPECT")
+        med = all_stats.get("survival_analysis", {}).get("median_bars_to_outcome", "N/A")
+        cvar = all_stats.get("tail_risk", {}).get("cvar_95_adverse_excursion", float('nan'))
+
         html += f"""
             <hr>
             <h2>Regime: {regime_name}</h2>
-            <h3>Overall Performance</h3>
-            <table>
-                <tr><th>Metric</th><th>Value</th></tr>
-                <tr><td>Total Episodes</td><td>{all_stats.get('n_episodes', 'N/A')}</td></tr>
-                <tr><td>Respect Rate</td><td>{all_stats.get('outcome_rates', {}).get('RESPECT', 0):.2%}</td></tr>
-                <tr><td>Respect Rate CI</td><td>{all_stats.get('outcome_rates_ci', {}).get('RESPECT', (0,0))[0]:.2%} - {all_stats.get('outcome_rates_ci', {}).get('RESPECT', (0,0))[1]:.2%}</td></tr>
-                <tr><td>Median Bars to Outcome</td><td>{all_stats.get('survival_analysis', {}).get('median_bars_to_outcome', 'N/A')}</td></tr>
-                <tr><td>CVaR95 Adverse Excursion</td><td>{all_stats.get('tail_risk', {}).get('cvar_95_adverse_excursion', 0):.2f} points</td></tr>
+
+            <h3>Summary Metrics</h3>
+            <table class="summary-table">
+                <tr>
+                    <th>Total Episodes</th>
+                    <th>Respect Rate (95% CI)</th>
+                    <th>Median Bars to Outcome</th>
+                    <th>CVaR95 Adverse Excursion</th>
+                </tr>
+                <tr>
+                    <td>{all_stats.get('n_episodes', 'N/A')}</td>
+                    <td>{rr:.2%} ({_fmt_ci_html(ci)})</td>
+                    <td>{med}</td>
+                    <td>{cvar:.2f} points</td>
+                </tr>
             </table>
 
-            <h3>Outcome Distributions</h3>
+            <h3>Comparative Cohort Analysis</h3>
+            <p>The following cohorts showed a statistically significant difference in respect rate compared to the baseline after FDR correction (q < {ZONE_SIGNIFICANCE_ALPHA}).</p>
+            <table>
+                <tr>
+                    <th>Cohort</th>
+                    <th>N</th>
+                    <th>Respect Rate (95% CI)</th>
+                    <th>Risk Diff (95% CI)</th>
+                    <th>q-value</th>
+                </tr>
+        """
+
+        significant_cohorts = []
+        for name, stats in results["statistics"].items():
+            comp = stats.get("comparative_respect_rate")
+            if comp and comp.get("reject_h0"):
+                rr_cohort = stats.get("outcome_rates", {}).get("RESPECT", float('nan'))
+                rr_ci = stats.get("outcome_rates_ci", {}).get("RESPECT")
+                rd_ci = comp.get("risk_difference_ci")
+                significant_cohorts.append({
+                    "name": name,
+                    "n": stats.get("n_episodes"),
+                    "rr_str": f"{rr_cohort:.2%} ({_fmt_ci_html(rr_ci)})",
+                    "rd_str": f"{comp.get('risk_difference', 0):+.2%} ({_fmt_ci_html(rd_ci)})",
+                    "q_value": f"{comp.get('q_value', 0):.3f}",
+                })
+
+        if significant_cohorts:
+            for cohort in sorted(significant_cohorts, key=lambda x: x["q_value"]):
+                html += f"""
+                    <tr>
+                        <td>{cohort['name']}</td>
+                        <td>{cohort['n']}</td>
+                        <td>{cohort['rr_str']}</td>
+                        <td>{cohort['rd_str']}</td>
+                        <td>{cohort['q_value']}</td>
+                    </tr>
+                """
+        else:
+            html += "<tr><td colspan='5' style='text-align:center;'>No cohorts showed a statistically significant difference.</td></tr>"
+
+        html += f"""
+            </table>
+
+            <h3>Outcome & Excursion Distributions</h3>
             {embed_img(os.path.join(out_dir, "charts", f'dist_outcomes_{regime_name}.png'))}
+            {embed_img(os.path.join(out_dir, "charts", f'dist_excursions_{regime_name}.png'))}
+            {embed_img(os.path.join(out_dir, "charts", f'respect_rate_ci_{regime_name}.png'))}
 
             <h3>Top Cohorts by Lift</h3>
             {embed_img(os.path.join(out_dir, "charts", f'plot_cohort_lift_{regime_name}.png'))}
-
-            <h3>Calibration</h3>
-            <table>
-                <tr><th>Decile</th><th>Mean Score</th><th>N Episodes</th><th>Observed Respect Rate</th></tr>
         """
-        cal_table = all_stats.get("calibration", [])
-        if cal_table:
-            for row in sorted(cal_table, key=lambda x: x["decile"]):
-                html += f"<tr><td>{row['decile']}</td><td>{row['mean_score']:.1f}</td><td>{row['n_episodes']}</td><td>{row['respect_rate']:.2%}</td></tr>"
-        html += "</table>"
+
+    # --- Add Glossary and Data Links ---
+    html += f"""
+        <hr>
+        <h3>Glossary of Terms</h3>
+        <dl>
+            <dt><strong>Respect</strong></dt>
+            <dd>Price touches the zone, exits favorably, and travels at least R points away without first breaking the zone.</dd>
+            <dt><strong>Pierce → Revert</strong></dt>
+            <dd>Price touches the zone, pierces into it (but not beyond the overshoot O), then reverts to travel R points in the favorable direction.</dd>
+            <dt><strong>Break</strong></dt>
+            <dd>Price closes beyond the zone plus the overshoot tolerance O.</dd>
+            <dt><strong>Timeout</strong></dt>
+            <dd>The episode is censored, either by reaching the maximum T bars or by a session boundary change, before a clear outcome is observed.</dd>
+        </dl>
+
+        <h3>Data Artifacts</h3>
+        <p>The following data files were generated alongside this report:</p>
+        <ul>
+            <li><a href="episodes.csv">episodes.csv</a></li>
+            <li><a href="zones.csv">zones.csv</a></li>
+            <li><a href="statistics.json">statistics.json</a></li>
+            <li><a href="summary.csv">summary.csv</a></li>
+            <li><a href="episodes_schema.json">episodes_schema.json</a></li>
+        </ul>
+    """
 
     html += """
     </body>
@@ -2548,11 +2663,77 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
     LOG.info(f"HTML report saved to {report_path}")
 
 
+def parse_wf_params(wf_string: str) -> Optional[Dict[str, str]]:
+    """Parses walk-forward parameters from a string."""
+    params = {}
+    if not wf_string:
+        return None
+    try:
+        for part in wf_string.replace(" ", "").split(","):
+            key, value = part.split("=")
+            params[key.strip()] = value.strip()
+        if "window" not in params or "step" not in params:
+            raise ValueError("window and step are required parameters.")
+        return params
+    except Exception as e:
+        LOG.error(f"Invalid --wf format: '{wf_string}'. Error: {e}")
+        LOG.error("Example of valid format: --wf 'window=90d,step=30d,test=30d'")
+        LOG.info(f"Parsed values: {params}")
+        return None
+
+
+def get_episodes_schema() -> Dict[str, str]:
+    """Returns a dictionary describing the columns of the episodes output file."""
+    return {
+        "zone_id": "Unique identifier for the zone that this episode belongs to.",
+        "zone_type": "Type of the zone: SUPPORT or RESISTANCE.",
+        "outcome": "The result of the episode: RESPECT, PIERCE_AND_REVERT, BREAK, TIMEOUT, or INVALID.",
+        "touch_time": "Timestamp of the first bar that touched the zone (ISO-8601 format).",
+        "outcome_time": "Timestamp of the bar where the outcome was decided (ISO-8601 format).",
+        "bars_to_outcome": "The number of bars from the touch to the outcome.",
+        "max_favorable": "Maximum price excursion in points in the favorable direction after the touch.",
+        "max_adverse": "Maximum price excursion in points in the adverse direction after the touch.",
+        "from_above": "Whether the price approached the zone from above (True), below (False), or from within (None).",
+        "end_idx": "The index of the outcome bar in the source dataframe.",
+        "touch_number": "The sequential number of this touch for the given zone.",
+        "regime": "The market regime under which this episode occurred.",
+        "rsi_at_touch": "RSI value at the time of the touch.",
+        "atr_at_touch": "ATR value at the time of the touch.",
+        "rvol_at_touch": "Relative volume at the time of the touch.",
+        "stoch_k_at_touch": "Stochastic %K value at the time of the touch.",
+        "stoch_d_at_touch": "Stochastic %D value at the time of the touch.",
+        "is_rth_at_touch": "Whether the touch occurred during Regular Trading Hours (RTH).",
+        "minute_of_day_at_touch": "The minute of the day (UTC) at the time of the touch.",
+        "hour_at_touch": "The hour of the day (UTC) at the time of the touch.",
+        "atr_tercile": "The tercile (low, mid, high) of the ATR at touch, relative to other episodes.",
+        "rvol_tercile": "The tercile (low, mid, high) of the relative volume at touch.",
+        "stoch_tercile": "The tercile (low, mid, high) of the stochastic %K at touch.",
+        "zone_age_days": "The age of the zone in days at the time of the touch.",
+        "approach_direction": "A more descriptive version of 'from_above': from_above, from_below, or inside.",
+        "rsi_at_outcome": "RSI value at the time of the outcome.",
+        "atr_at_outcome": "ATR value at the time of the outcome.",
+        "rvol_at_outcome": "Relative volume at the time of the outcome.",
+        "stoch_k_at_outcome": "Stochastic %K value at the time of the outcome.",
+        "stoch_d_at_outcome": "Stochastic %D value at the time of the outcome.",
+    }
+
+def save_episodes_schema(out_dir: str):
+    """Saves the episodes schema to a JSON file."""
+    schema = get_episodes_schema()
+    path = os.path.join(out_dir, "episodes_schema.json")
+    with open(path, "w") as f:
+        json.dump(schema, f, indent=2)
+    LOG.info(f"Saved episode schema to {path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="market_stats_engine",
         description="Production-ready market statistics engine",
     )
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase log verbosity (-v or -vv)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Only show warnings and errors")
+
     subparsers = parser.add_subparsers(dest="command", help="Commands", required=True)
 
     # --- Prepare Command ---
@@ -2569,7 +2750,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser = subparsers.add_parser("analyze", help="Run statistical analysis")
     analyze_parser.add_argument("--data", required=True, help="Prepared data file")
     analyze_parser.add_argument("--config", help="Engine config file (YAML/JSON)")
-    analyze_parser.add_argument("--out", default="results/", help="Output directory")
+    analyze_parser.add_argument("--out", help="Output directory. Defaults to a unique path in 'runs/'.")
     analyze_parser.add_argument(
         "--wf",
         help='Enable walk-forward validation. e.g., "window=90d,step=30d[,test=30d]"'
@@ -2586,7 +2767,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument(
         "--max-maps",
         type=int,
-        default=100,
+        default=30,
         help="Max number of daily maps to generate (most recent).",
     )
     analyze_parser.add_argument(
@@ -2606,6 +2787,8 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument(
         "--block-size", type=int, help="Override for bootstrap block size."
     )
+    analyze_parser.add_argument("--no-plots", action="store_true", help="Suppress generation of all plot PNGs.")
+    analyze_parser.add_argument("--no-maps", action="store_true", help="Suppress generation of daily map charts.")
 
     # --- Sweep Command ---
     sweep_parser = subparsers.add_parser("sweep", help="Parameter sweep")
@@ -2614,7 +2797,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--grid", required=True, help="Parameter grid file (JSON or YAML)"
     )
     sweep_parser.add_argument(
-        "--out", default="sweep_results/", help="Output directory"
+        "--out", help="Output directory. Defaults to a unique path in 'sweep_results/'."
     )
     sweep_parser.add_argument(
         "--db", help="Path to SQLite database for results lineage."
@@ -2637,6 +2820,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.quiet:
+        LOG.setLevel(logging.WARNING)
+    elif args.verbose == 1:
+        LOG.setLevel(logging.INFO)
+    elif args.verbose >= 2:
+        LOG.setLevel(logging.DEBUG)
 
     if args.command == "self-test":
         run_self_test()
@@ -2684,6 +2874,16 @@ def main():
                 "Engine 'fast' selected but Polars not found. Falling back to pandas."
             )
 
+    run_uuid = str(uuid.uuid4())
+    if hasattr(args, "out") and not args.out:
+        ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        if args.command == 'analyze':
+            symbol = config.instrument.symbol
+            args.out = f"runs/{symbol}_{ts}"
+        elif args.command == 'sweep':
+            args.out = f"sweep_results/sweep_{ts}"
+        LOG.info(f"No output directory specified. Using default: {args.out}")
+
     if hasattr(args, "dry_run") and args.dry_run:
         LOG.info("--- Dry Run Mode ---")
         LOG.info("Configuration:")
@@ -2711,7 +2911,7 @@ def main():
         LOG.addHandler(fh)
 
         base_metadata = {
-            "run_uuid": str(uuid.uuid4()),
+            "run_uuid": run_uuid,
             "run_timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "command": args.command,
             "args": vars(args),
@@ -2770,18 +2970,10 @@ def main():
             run_pk = persistence.insert_run(base_metadata) if persistence else None
 
             if args.wf:
-                wf_config = {}
-                try:
-                    for part in args.wf.replace(" ", "").split(","):
-                        key, value = part.split("=")
-                        wf_config[key.strip()] = value.strip()
-                    if "window" not in wf_config or "step" not in wf_config:
-                        raise ValueError("window and step required")
-                except Exception as e:
-                    LOG.error(f"Invalid --wf format: {e}. Use 'window=90d,step=30d[,test=30d]'.")
+                wf_params = parse_wf_params(args.wf)
+                if not wf_params:
                     return
-
-                wf_results = run_walk_forward_analysis(df, config, wf_config)
+                wf_results = run_walk_forward_analysis(df, config, wf_params)
                 if wf_results and "all_data" in wf_results:
                     # Simplified handling for walk-forward with regimes
                     # We report the aggregate of all OOS episodes regardless of regime
@@ -2879,28 +3071,65 @@ def main():
                         )
 
                 # Plotting for each regime
-                charts_dir = os.path.join(args.out, "charts")
-                Path(charts_dir).mkdir(parents=True, exist_ok=True)
-                for regime_name, results in all_results.items():
-                    plot_episodes_df = pd.DataFrame(results["episodes"])
-                    if not plot_episodes_df.empty:
-                        save_distribution_plots(plot_episodes_df, charts_dir, regime_name)
-                        save_cohort_lift_plot(results["statistics"], charts_dir, regime_name)
+                if not getattr(args, "no_plots", False):
+                    charts_dir = os.path.join(args.out, "charts")
+                    Path(charts_dir).mkdir(parents=True, exist_ok=True)
+                    for regime_name, results in all_results.items():
+                        plot_episodes_df = pd.DataFrame(results["episodes"])
+                        if not plot_episodes_df.empty:
+                            save_distribution_plots(plot_episodes_df, charts_dir, regime_name)
+                            save_cohort_lift_plot(results["statistics"], charts_dir, regime_name)
+                            save_respect_rate_ci_plot(results["statistics"], charts_dir, regime_name)
 
-                    # Daily maps are expensive, so let's check for zones too
-                    if not df.empty and results["zones"]:
-                        save_daily_maps(
-                            df,
-                            results["zones"],
-                            results["episodes"],
-                            charts_dir,
-                            regime_name,
-                            max_maps=args.max_maps,
-                        )
+                        # Daily maps are expensive, so let's check for zones too
+                        if not getattr(args, "no_maps", False) and not df.empty and results["zones"]:
+                            save_daily_maps(
+                                df,
+                                results["zones"],
+                                results["episodes"],
+                                charts_dir,
+                                regime_name,
+                                max_maps=args.max_maps,
+                            )
 
                 if args.report:
                     LOG.info("Generating HTML report...")
                     generate_html_report(all_results, args.out, config)
+
+                # --- Save schema and summary ---
+                save_episodes_schema(args.out)
+                summary_data = []
+                for regime_name, results in all_results.items():
+                    s = results["statistics"].get("all", {})
+                    rr = s.get("outcome_rates", {}).get("RESPECT", float('nan'))
+                    ci = s.get("outcome_rates_ci", {}).get("RESPECT", (None, None))
+                    med = s.get("survival_analysis", {}).get("median_bars_to_outcome", "N/A")
+                    cvar = s.get("tail_risk", {}).get("cvar_95_adverse_excursion", float('nan'))
+                    summary_data.append({
+                        "regime": regime_name,
+                        "n_episodes": s.get("n_episodes", 0),
+                        "respect_rate": rr,
+                        "respect_rate_ci_low": ci[0] if ci else None,
+                        "respect_rate_ci_high": ci[1] if ci else None,
+                        "median_bars_to_outcome": med,
+                        "cvar_95_adverse_excursion": cvar,
+                    })
+
+                if summary_data:
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_csv(os.path.join(args.out, "summary.csv"), index=False, float_format="%.4f")
+                    LOG.info(f"Saved summary metrics to {os.path.join(args.out, 'summary.csv')}")
+
+                # --- Console Summary ---
+                def _fmt_ci(ci_tuple):
+                    return "N/A" if not ci_tuple or ci_tuple[0] is None else f"{ci_tuple[0]:.2%} – {ci_tuple[1]:.2%}"
+
+                LOG.info("--- Run Summary ---")
+                for item in summary_data:
+                    LOG.info(f"[{item['regime']:>12}] N={item['n_episodes']:5d} "
+                             f"Respect={item['respect_rate']:.2%} ({_fmt_ci((item['respect_rate_ci_low'], item['respect_rate_ci_high']))})  "
+                             f"Median bars={item['median_bars_to_outcome']}  CVaR95 adverse={item['cvar_95_adverse_excursion']:.2f} pts")
+
 
         elif args.command == "sweep":
             # Note: Regime analysis is not supported in sweep mode for simplicity.
@@ -3131,14 +3360,17 @@ def run_sweep_item(args_tuple):
 
 
 def run_self_test():
-    """Generates a tiny synthetic OHLC series and runs the full pipeline."""
-    LOG.info("--- Running Self-Test ---")
-    # 1. Generate synthetic data with a clear support zone around 100
-    timestamps = pd.to_datetime(
-        pd.date_range(
-            start="2023-01-01 09:30", periods=200, freq="1min", tz="America/New_York"
-        )
-    )
+    """Generates a tiny synthetic OHLC series and runs the full pipeline as a demo."""
+    LOG.info("--- Running Self-Test (Demo Run) ---")
+
+    # --- Setup ---
+    ts = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_dir = f"runs/self_test_{ts}"
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    LOG.info(f"Self-test artifacts will be saved to: {out_dir}")
+
+    # --- Generate Data ---
+    timestamps = pd.to_datetime(pd.date_range(start="2023-01-01 09:30", periods=200, freq="1min", tz="America/New_York"))
     price = 102.0
     prices = []
     rng = np.random.default_rng(42)
@@ -3149,23 +3381,16 @@ def run_self_test():
             price += rng.uniform(-1, 1) * 0.25
         prices.append(price)
 
-    df = pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": prices,
-            "high": [p + 0.1 for p in prices],
-            "low": [p - 0.1 for p in prices],
-            "close": prices,
-            "volume": rng.integers(100, 1000, size=len(prices)),
-        }
-    )
+    df = pd.DataFrame({
+        "timestamp": timestamps, "open": prices, "high": [p + 0.1 for p in prices],
+        "low": [p - 0.1 for p in prices], "close": prices,
+        "volume": rng.integers(100, 1000, size=len(prices)),
+    })
 
-    # 2. Run analysis with default config + a simple regime
+    # --- Run Analysis ---
     config = EngineConfig()
     config.zones.min_touches_for_significance = 2
     config.zones.significance_test = False
-
-    # Add a simple regime config for testing
     config.regime_config = RegimeConfig(enabled=True, regimes=[
         Regime(name="first_half", condition="index < 100"),
         Regime(name="second_half", condition="index >= 100")
@@ -3174,18 +3399,67 @@ def run_self_test():
     df = ensure_prepared(df, config)
     all_results = run_analysis(df, config)
 
-    # 3. Assert basic invariants
+    # --- Save Artifacts ---
+    class MockArgs:
+        def __init__(self, out_dir):
+            self.out = out_dir
+            self.no_plots = False
+            self.no_maps = False
+            self.report = True
+            self.max_maps = 10
+
+    args = MockArgs(out_dir)
+
+    all_zones, all_episodes, all_stats_flat = [], [], {}
+    for regime_name, results in all_results.items():
+        for z in results["zones"]: z.regime = regime_name
+        for e in results["episodes"]: e["regime"] = regime_name
+        all_zones.extend(results["zones"])
+        all_episodes.extend(results["episodes"])
+        for cohort, stats in results["statistics"].items():
+            all_stats_flat[f"{regime_name}_{cohort}"] = stats
+
+    zones_df = pd.DataFrame([dataclasses.asdict(z) for z in all_zones])
+    if not zones_df.empty:
+        zones_df["type"] = zones_df["type"].apply(lambda x: x.value if isinstance(x, Enum) else x)
+        zones_df["activation_time"] = pd.to_datetime(zones_df["activation_time"])
+    zones_df.to_csv(os.path.join(out_dir, "zones.csv"), index=False)
+
+    episodes_df = pd.DataFrame(all_episodes)
+    if not episodes_df.empty:
+        for col in ("outcome", "zone_type"):
+            if col in episodes_df.columns:
+                episodes_df[col] = episodes_df[col].apply(lambda x: x.value if isinstance(x, Enum) else x)
+        for col in ("touch_time", "outcome_time"):
+            if col in episodes_df.columns:
+                episodes_df[col] = pd.to_datetime(episodes_df[col])
+    episodes_df.to_csv(os.path.join(out_dir, "episodes.csv"), index=False)
+
+    if not getattr(args, "no_plots", False):
+        charts_dir = os.path.join(out_dir, "charts")
+        Path(charts_dir).mkdir(parents=True, exist_ok=True)
+        for regime_name, results in all_results.items():
+            plot_episodes_df = pd.DataFrame(results["episodes"])
+            if not plot_episodes_df.empty:
+                save_distribution_plots(plot_episodes_df, charts_dir, regime_name)
+                save_cohort_lift_plot(results["statistics"], charts_dir, regime_name)
+                save_respect_rate_ci_plot(results["statistics"], charts_dir, regime_name)
+            if not getattr(args, "no_maps", False) and not df.empty and results["zones"]:
+                save_daily_maps(df, results["zones"], results["episodes"], charts_dir, regime_name, max_maps=args.max_maps)
+
+    if args.report:
+        generate_html_report(all_results, out_dir, config)
+
+    save_episodes_schema(out_dir)
+
+    # --- Assert basic invariants ---
     try:
         assert "first_half" in all_results, "Self-test failed: 'first_half' regime missing."
-        assert "second_half" in all_results, "Self-test failed: 'second_half' regime missing."
-        first_half_results = all_results["first_half"]
-        assert len(first_half_results["zones"]) > 0, "Self-test failed: No zones in first_half."
-        assert len(first_half_results["episodes"]) > 0, "Self-test failed: No episodes in first_half."
-        assert first_half_results["statistics"]["all"]["n_episodes"] > 0, "Self-test failed: Zero episodes in first_half stats."
-        LOG.info("--- SELF-TEST OK ---")
+        assert len(all_results["first_half"]["zones"]) > 0, "Self-test failed: No zones in first_half."
+        assert len(all_results["first_half"]["episodes"]) > 0, "Self-test failed: No episodes in first_half."
+        LOG.info(f"--- SELF-TEST OK --- (Artifacts in {out_dir})")
     except AssertionError as e:
         LOG.error(f"--- SELF-TEST FAILED: {e} ---", exc_info=True)
-        # Optionally re-raise or sys.exit(1)
         raise
 
 
