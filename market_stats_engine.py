@@ -377,6 +377,7 @@ class EngineConfig:
     cache_dir: str = "cache"
     out_dir: str = "runs/run_latest"
     random_seed: Optional[int] = 42
+    bootstrap_block_size: Optional[int] = None  # <-- add back
 
 
 @dataclass
@@ -617,6 +618,12 @@ def round_to_tick(x: float, tick: float) -> float:
     if tick == 0:
         return x
     return round(round(x / tick) * tick, 10)
+
+
+def _blk(config: EngineConfig) -> int:
+    """Helper to get the bootstrap block size, falling back to a dynamic default."""
+    bs = getattr(config, "bootstrap_block_size", None)
+    return int(bs) if (bs is not None and bs > 0) else max(5, config.episode.T // 2)
 
 
 def _ensure_utc_timestamps(df: pd.DataFrame) -> pd.DataFrame:
@@ -1630,17 +1637,11 @@ def _run_single_analysis(
                     .values
                 )
 
-                block_size = (
-                    config.bootstrap_block_size
-                    if config.bootstrap_block_size is not None
-                    else (config.episode.T // 2 or 5)
-                )
-
                 try:
                     risk_diff, ci, p_val = bootstrap_risk_difference(
                         cohort_outcomes,
                         baseline_outcomes,
-                        block_size=block_size,
+                        block_size=_blk(config),
                         seed=config.random_seed,
                     )
 
@@ -1899,7 +1900,7 @@ def compute_statistics(
         y = np.array([(1 if (e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"]) == outcome_str else 0)
                       for e in valid_episodes], dtype=float)
         stats["outcome_rates_ci"][outcome_str] = block_bootstrap_prop_ci(
-            y, n_boot=3000, block_size=max(5, config.episode.T // 2), alpha=alpha, seed=config.random_seed
+            y, n_boot=3000, block_size=_blk(config), alpha=alpha, seed=config.random_seed
         )
 
     for metric_name in ["bars_to_outcome", "max_favorable", "max_adverse"]:
@@ -1907,7 +1908,6 @@ def compute_statistics(
             [e[metric_name] for e in valid_episodes if e.get(metric_name) is not None]
         )
         if len(data) > 1:
-            block_size = config.episode.T // 2 or 5
             stats["bootstrapped_metrics"][metric_name] = {
                 "mean": np.mean(data),
                 "median": np.median(data),
@@ -1917,14 +1917,14 @@ def compute_statistics(
                     data,
                     np.mean,
                     n_boot=1000,
-                    block_size=block_size,
+                    block_size=_blk(config),
                     seed=config.random_seed,
                 ),
                 "median_ci": block_bootstrap_ci(
                     data,
                     np.median,
                     n_boot=1000,
-                    block_size=block_size,
+                    block_size=_blk(config),
                     seed=config.random_seed,
                 ),
             }
@@ -2475,7 +2475,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
     block_size_str = (
         str(config.bootstrap_block_size)
         if config.bootstrap_block_size is not None
-        else f"dynamic (T//2, default: {max(5, config.episode.T // 2)})"
+        else f"dynamic (T//2, default: {_blk(config)})"
     )
     timeout_treatment = "BREAK" if config.episode.treat_timeout_as_break else "TIMEOUT"
 
@@ -2587,6 +2587,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument(
         "--regimes", help="Path to YAML file defining market regimes."
     )
+    analyze_parser.add_argument(
+        "--block-size", type=int, help="Override for bootstrap block size."
+    )
 
     # --- Sweep Command ---
     sweep_parser = subparsers.add_parser("sweep", help="Parameter sweep")
@@ -2627,6 +2630,10 @@ def main():
     if hasattr(args, "seed") and args.seed is not None:
         config.random_seed = args.seed
         LOG.info(f"Using random seed: {config.random_seed}")
+
+    if hasattr(args, "block_size") and args.block_size is not None:
+        config.bootstrap_block_size = args.block_size
+        LOG.info(f"Using manual bootstrap block size: {config.bootstrap_block_size}")
 
     # Deterministic RNG
     if config.random_seed is not None:
@@ -2906,7 +2913,7 @@ def main():
                 f"Baseline run complete. Found {len(base_y)} episodes for comparison."
             )
 
-            block_size = config.bootstrap_block_size or (max(5, config.episode.T // 2))
+            block_size = _blk(config)
 
             task_args = [
                 (
@@ -3001,6 +3008,13 @@ def run_sweep_item(args_tuple):
     run_config = EngineConfig()
     update_dataclass_from_dict(run_config, config_dict)
     update_dataclass_from_dict(run_config, params)
+
+    # Derive a deterministic, unique seed for this sweep item to ensure reproducibility
+    base_seed = run_config.random_seed or 0
+    param_hash = hash(json.dumps(params, sort_keys=True))
+    item_seed = (base_seed ^ param_hash) & 0xFFFFFFFF
+    run_config.random_seed = int(item_seed)
+    np.random.seed(run_config.random_seed)
 
     persistence = SQLitePersistence(db_path) if db_path else None
     try:
