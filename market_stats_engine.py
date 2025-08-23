@@ -38,8 +38,8 @@ python market_stats_engine.py analyze --data cache/nq_prepared.parquet --out res
 # ---------------------
 python market_stats_engine.py analyze --data cache/cl_prepared.parquet --config cl_config.yml --out results/cl_run_1
 
-# 3. Walk-forward validation (90-day training window, 30-day testing step)
-python market_stats_engine.py analyze --data cache/es_prepared.parquet --wf "window=90d,step=30d" --out results/es_wf
+# 3. Walk-forward validation (90-day training window, 30-day testing step, optional 30-day test size)
+python market_stats_engine.py analyze --data cache/es_prepared.parquet --wf "window=90d,step=30d,test=30d" --out results/es_wf
 
 # 4. Generate a self-contained HTML report
 python market_stats_engine.py analyze --data cache/nq_prepared.parquet --report --out results/nq_report
@@ -2091,12 +2091,10 @@ class SQLitePersistence:
                 run_pk,
                 e.get("regime", "all_data"),
                 e["zone_id"],
-                e["zone_type"].value
-                if isinstance(e["zone_type"], Enum)
-                else e["zone_type"],
+                e["zone_type"].value if isinstance(e["zone_type"], Enum) else e["zone_type"],
                 e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"],
-                str(e["touch_time"]),
-                str(e["outcome_time"]),
+                (e["touch_time"].isoformat() if hasattr(e["touch_time"], "isoformat") else str(e["touch_time"])),
+                (e["outcome_time"].isoformat() if hasattr(e["outcome_time"], "isoformat") else str(e["outcome_time"])),
                 e["bars_to_outcome"],
                 e["max_favorable"],
                 e["max_adverse"],
@@ -2999,7 +2997,13 @@ def main():
                     df_summary.loc[mask, "reject_h0"] = reject
 
             if "respect_rate" in df_summary.columns and len(df_summary) > 0:
-                baseline_rate = df_summary.iloc[0]["respect_rate"]
+                # Use the actual baseline row (param_grid[0]) instead of the first row after sorting
+                baseline_key = json.dumps(baseline_params)  # matches how we stored "params"
+                mask = df_summary["params"] == baseline_key
+                if mask.any():
+                    baseline_rate = float(df_summary.loc[mask, "respect_rate"].iloc[0])
+                else:
+                    baseline_rate = float(df_summary["respect_rate"].iloc[0])
 
                 def _h(p, q=baseline_rate):
                     p = min(max(p, 1e-12), 1 - 1e-12)
