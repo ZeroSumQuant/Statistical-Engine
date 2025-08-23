@@ -706,7 +706,8 @@ class DataValidator:
                 )
                 # floor to a tiny positive value to avoid zero-MAD blowups
                 mad = mad.replace(0, np.nan)
-                mad = mad.fillna(df["returns"].mad())  # global MAD fallback
+                global_mad = (df["returns"] - df["returns"].median()).abs().median()
+                mad = mad.fillna(global_mad if np.isfinite(global_mad) and global_mad > 0 else 1e-6)
                 outlier_threshold = self.config.outlier_std_threshold * mad * 1.4826 + 1e-9
                 outliers = df["returns"].abs() > outlier_threshold
             else:
@@ -800,9 +801,13 @@ def annotate_sessions(df: pd.DataFrame, config: InstrumentConfig) -> pd.DataFram
     df["minute_of_day"] = df["local_time"].dt.hour * 60 + df["local_time"].dt.minute
     rth_start = pd.to_datetime(config.rth_start).time()
     rth_end = pd.to_datetime(config.rth_end).time()
-    df["is_rth"] = (df["local_time"].dt.time >= rth_start) & (
-        df["local_time"].dt.time < rth_end
-    )
+    times = df["local_time"].dt.time
+    if rth_end > rth_start:
+        is_rth = (times >= rth_start) & (times < rth_end)
+    else:
+        # wraps midnight
+        is_rth = (times >= rth_start) | (times < rth_end)
+    df["is_rth"] = is_rth
     return df
 
 
@@ -1805,7 +1810,7 @@ def compute_cvar(data: np.ndarray, alpha: float = 0.95) -> Optional[float]:
     a = np.asarray(data)
     if len(a) < 30:
         a = np.sort(a)
-        k = max(0, int(np.floor(0.95 * len(a))))
+        k = max(0, int(np.floor(alpha * len(a))))  # <- use alpha, not 0.95
         # ensure at least one element in the tail
         return float(a[k:].mean() if k < len(a) else a[-1])
     var = np.percentile(a, alpha * 100)
@@ -2334,7 +2339,8 @@ def run_walk_forward_analysis(
     df: pd.DataFrame, config: EngineConfig, wf_params: Dict[str, str]
 ):
     """Runs the analysis pipeline using walk-forward validation."""
-    slices = walk_forward_slices(df, window=wf_params["window"], step=wf_params["step"])
+    slices = walk_forward_slices(df, window=wf_params["window"], step=wf_params["step"],
+                             test_size=wf_params.get("test"))
     if not slices:
         LOG.error("Could not generate any walk-forward slices from the data.")
         return None
@@ -2783,7 +2789,14 @@ def main():
                         json.dump(
                             agg_results["per_slice_statistics"], f, indent=2, default=str
                         )
-                    pd.DataFrame(agg_results["all_oos_episodes"]).to_csv(
+                    episodes_df = pd.DataFrame(agg_results["all_oos_episodes"]).copy()
+                    for col in ("outcome", "zone_type"):
+                        if col in episodes_df.columns:
+                            episodes_df[col] = episodes_df[col].apply(lambda x: x.value if isinstance(x, Enum) else x)
+                    for col in ("touch_time", "outcome_time"):
+                        if col in episodes_df.columns:
+                            episodes_df[col] = pd.to_datetime(episodes_df[col])
+                    episodes_df.to_csv(
                         f"{args.out}/episodes_walkforward.csv", index=False
                     )
                     if persistence and run_pk:
@@ -2821,9 +2834,17 @@ def main():
                         all_stats_flat[f"{regime_name}_{cohort}"] = stats
 
                 pd.DataFrame([dataclasses.asdict(z) for z in all_zones]).to_csv(f"{args.out}/zones.csv", index=False)
-                pd.DataFrame(all_episodes).to_csv(f"{args.out}/episodes.csv", index=False)
+                episodes_df = pd.DataFrame(all_episodes).copy()
+                for col in ("outcome", "zone_type"):
+                    if col in episodes_df.columns:
+                        episodes_df[col] = episodes_df[col].apply(lambda x: x.value if isinstance(x, Enum) else x)
+                for col in ("touch_time", "outcome_time"):
+                    if col in episodes_df.columns:
+                        episodes_df[col] = pd.to_datetime(episodes_df[col])
+
+                episodes_df.to_csv(f"{args.out}/episodes.csv", index=False)
                 if HAVE_PARQUET:
-                    pd.DataFrame(all_episodes).to_parquet(f"{args.out}/episodes.parquet", index=False)
+                    episodes_df.to_parquet(f"{args.out}/episodes.parquet", index=False)
                     pd.DataFrame([dataclasses.asdict(z) for z in all_zones]).to_parquet(f"{args.out}/zones.parquet", index=False)
                 with open(f"{args.out}/statistics.json", "w") as f:
                     json.dump(all_stats_flat, f, indent=2, default=str)
@@ -2918,8 +2939,6 @@ def main():
                 f"Baseline run complete. Found {len(base_y)} episodes for comparison."
             )
 
-            block_size = _blk(config)
-
             task_args = [
                 (
                     params,
@@ -2928,7 +2947,6 @@ def main():
                     base_metadata,
                     db_path,
                     base_y.tolist(),
-                    block_size,
                 )
                 for params in param_grid
             ]
@@ -3007,7 +3025,6 @@ def run_sweep_item(args_tuple):
         base_metadata,
         db_path,
         base_y_list,
-        block_size,
     ) = args_tuple
 
     run_config = EngineConfig()
