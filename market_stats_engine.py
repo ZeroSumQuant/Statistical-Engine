@@ -76,6 +76,12 @@ try:
 except:
     HAVE_YAML = False
 
+try:
+    from statsmodels.stats.multitest import multipletests
+    HAVE_STATSMODELS = True
+except:
+    HAVE_STATSMODELS = False
+
 
 try:
     from zoneinfo import ZoneInfo
@@ -167,6 +173,7 @@ class ZoneConfig:
     null_width_multiplier: float = 1.5 # Multiplier for significance test width
     expire_days: int = 30
     merge_tolerance_points: float = 2.0
+    max_cluster_span_days: Optional[int] = None # Max time span for a single cluster
     min_touches_for_significance: int = 2
     significance_test: bool = True  # New: enable statistical testing
 
@@ -521,8 +528,15 @@ class TrackingOutcome(EpisodeState):
         if context.get("pierced_before", False) and respected_now:
             return EpisodeOutcome.PIERCE_AND_REVERT, None
 
-        # 3. Respect: Reversed by R without breaking (and without a prior pierce)
-        if respected_now:
+        # Check for favorable exit before respect
+        if not context.get("exited_favorably", False):
+            if direction == 1 and bar["high"] < (zone["level"] - zone["width"]): # Exited below support
+                context["exited_favorably"] = True
+            elif direction == -1 and bar["low"] > (zone["level"] + zone["width"]): # Exited above resistance
+                context["exited_favorably"] = True
+
+        # 3. Respect: Reversed by R without breaking, after a favorable exit
+        if context.get("exited_favorably", False) and respected_now:
             return EpisodeOutcome.RESPECT, None
 
         # 4. Timeout
@@ -686,7 +700,7 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
     for pivot_list, zone_type in [(high_pivots, ZoneType.RESISTANCE),
                                (low_pivots, ZoneType.SUPPORT)]:
 
-        zones_this_type = []
+        candidate_zones = []
         clusters = cluster_pivots(pivot_list, config)
 
         for cluster in clusters:
@@ -696,61 +710,50 @@ def detect_zones_with_significance(df: pd.DataFrame, config: ZoneConfig) -> List
             touches = [p["price"] for p in cluster]
             level = np.mean(touches)
 
-            # Calculate zone width: either fixed or ATR-based
             if config.zone_width_alpha_atr is not None:
-                t0 = min(p["center_time"] for p in cluster)
-                t1 = max(p["center_time"] for p in cluster)
+                # ... (width calculation logic is the same)
+                t0, t1 = min(p["center_time"] for p in cluster), max(p["center_time"] for p in cluster)
                 local_df = df[(df["timestamp"] >= t0) & (df["timestamp"] <= t1)]
-
-                if not local_df.empty and not local_df["atr"].isnull().all():
-                    atr_ref = float(local_df["atr"].median())
-                else:
-                    atr_ref = float(df["atr"].median())
-
+                atr_ref = float(local_df["atr"].median()) if not local_df.empty and not local_df["atr"].isnull().all() else float(df["atr"].median())
                 width = max(1e-9, config.zone_width_alpha_atr * atr_ref)
             else:
                 width = config.zone_width_points or 15.0
 
-            # Test significance if enabled
+            p_value = 1.0
             if config.significance_test:
-                # Define a wider, more appropriate null window for the significance test.
-                # The window is the full price range of the session(s) the cluster spans.
-                min_time = min(p['center_time'] for p in cluster)
-                max_time = max(p['center_time'] for p in cluster)
-
-                # Find all unique session dates the cluster's pivots fall into.
+                min_time, max_time = min(p['center_time'] for p in cluster), max(p['center_time'] for p in cluster)
                 sessions_spanned = df[(df['timestamp'] >= min_time) & (df['timestamp'] <= max_time)]['session_date'].unique()
-
-                # Get all price data from those sessions to form the null distribution.
                 local_prices_df = df[df['session_date'].isin(sessions_spanned)]
-
-                if local_prices_df.empty:
-                    is_significant, p_value = False, 1.0
-                else:
-                    # Use a wider test width for the null hypothesis to make the test more conservative
+                if not local_prices_df.empty:
                     width_for_test = max(width, (config.cluster_width_points or width) * config.null_width_multiplier)
                     local_prices = pd.concat([local_prices_df['high'], local_prices_df['low']])
-                    is_significant, p_value = test_zone_significance(
-                        touches, level, width_for_test, local_prices
-                    )
+                    _, p_value = test_zone_significance(touches, level, width_for_test, local_prices)
 
-                if not is_significant:
-                    LOG.debug(f"Zone at {level:.2f} not significant (p={p_value:.3f}, {len(touches)} touches)")
-                    continue
-            else:
-                is_significant = True
-                p_value = 0.0
-
-            # Sort by time to find the true activation time (confirmation of the second touch)
             cluster_sorted_by_time = sorted(cluster, key=lambda p: p["confirm_time"])
             activation_time = cluster_sorted_by_time[1]["confirm_time"] if len(cluster) > 1 else cluster_sorted_by_time[0]["confirm_time"]
 
-            zone = Zone(
-                id=zone_id, type=zone_type, level=level, width=width,
+            candidate_zones.append(Zone(
+                id=0, type=zone_type, level=level, width=width,
                 activation_time=activation_time, touches=touches, p_value=p_value,
-                is_significant=is_significant, expire_days=config.expire_days
-            )
-            zones_this_type.append(zone)
+                is_significant=False, expire_days=config.expire_days
+            ))
+
+        # Multiple testing correction
+        if config.significance_test and candidate_zones:
+            p_values = [z.p_value for z in candidate_zones]
+            if HAVE_STATSMODELS:
+                reject, _, _, _ = multipletests(p_values, alpha=ZONE_SIGNIFICANCE_ALPHA, method='fdr_bh')
+                significant_zones = [zone for zone, is_sig in zip(candidate_zones, reject) if is_sig]
+            else:
+                LOG.warning("statsmodels not found. Skipping multiple testing correction. Please `pip install statsmodels`.")
+                significant_zones = [zone for zone in candidate_zones if zone.p_value < ZONE_SIGNIFICANCE_ALPHA]
+        else:
+            significant_zones = candidate_zones
+
+        # Finalize zones with correct IDs
+        zones_this_type = []
+        for zone in significant_zones:
+            zones_this_type.append(dataclasses.replace(zone, id=zone_id, is_significant=True))
             zone_id += 1
 
         # Merge close zones of the same type
@@ -815,11 +818,19 @@ def cluster_pivots(pivots: List[Dict], config: ZoneConfig) -> List[List[Dict]]:
     current_cluster = [sorted_pivots[0]]
 
     for pivot in sorted_pivots[1:]:
-        # Check if pivot belongs to current cluster
+        # Check if pivot belongs to current cluster based on price
         cluster_center = np.mean([p["price"] for p in current_cluster])
         width = config.cluster_width_points or 15.0 # Use dedicated clustering width
+        price_is_close = abs(pivot["price"] - cluster_center) <= width
 
-        if abs(pivot["price"] - cluster_center) <= width:
+        # Check time span if configured
+        time_is_close = True
+        if config.max_cluster_span_days is not None:
+            min_time = min(p['center_time'] for p in current_cluster)
+            if (pivot['center_time'] - min_time).days > config.max_cluster_span_days:
+                time_is_close = False
+
+        if price_is_close and time_is_close:
             current_cluster.append(pivot)
         else:
             if len(current_cluster) >= config.min_touches_for_significance:
@@ -857,8 +868,8 @@ def prepare_data(files: List[str], config: EngineConfig) -> pd.DataFrame:
         if missing:
             raise ValueError(f"Missing columns in {file}: {missing}")
 
-        # Parse timestamp and sort before any processing
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        # Ensure UTC timestamps and sort before any processing
+        df = _ensure_utc_timestamps(df)
         df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
 
         # Annotate sessions first to enable session-based validation
@@ -1292,9 +1303,10 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
                 label = outcome.value if hasattr(outcome, "value") else str(outcome)
                 outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(label, 'grey')
 
-                touch_bars = df[df['timestamp'] == episode['touch_time']]
-                if not touch_bars.empty:
-                    touch_price = touch_bars['close'].iloc[0]
+                # Use searchsorted for robust timestamp lookup
+                touch_idx = df['timestamp'].searchsorted(episode['touch_time'], side='left')
+                if touch_idx < len(df):
+                    touch_price = df['close'].iat[touch_idx]
                     ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
                     ax.text(episode['outcome_time'], touch_price, label, color=outcome_color)
 
@@ -1307,6 +1319,22 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
         plt.close(fig)
     LOG.info("Daily maps saved.")
 
+
+def _ensure_utc_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensures the timestamp column is a timezone-aware UTC timestamp."""
+    if "timestamp" not in df.columns:
+        raise ValueError("DataFrame must have a 'timestamp' column.")
+
+    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+    if df['timestamp'].dt.tz is None:
+        LOG.info("Timestamp column is timezone-naive, localizing to UTC.")
+        df['timestamp'] = df['timestamp'].dt.tz_localize("UTC")
+    else:
+        df['timestamp'] = df['timestamp'].dt.tz_convert("UTC")
+
+    return df
 
 def ensure_prepared(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
     """Checks if data has been prepared, and if not, runs preparation steps."""
@@ -1426,8 +1454,9 @@ def main():
                 raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
             df = pd.read_parquet(args.data)
         else:
-            df = pd.read_csv(args.data, parse_dates=["timestamp"])
+            df = pd.read_csv(args.data)
 
+        df = _ensure_utc_timestamps(df)
         df = ensure_prepared(df, config)
 
         # Run analysis
@@ -1491,8 +1520,9 @@ def main():
                 raise ImportError("pyarrow is required to read Parquet files. Please `pip install pyarrow`.")
             df = pd.read_parquet(args.data)
         else:
-            df = pd.read_csv(args.data, parse_dates=["timestamp"])
+            df = pd.read_csv(args.data)
 
+        df = _ensure_utc_timestamps(df)
         df = ensure_prepared(df, config)
 
         # Load parameter grid
