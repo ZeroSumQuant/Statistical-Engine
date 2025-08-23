@@ -83,15 +83,15 @@ except:
     HAVE_STATSMODELS = False
 
 
+pytz = None
 try:
     from zoneinfo import ZoneInfo
-except:
-    try:
-        import pytz
-        ZoneInfo = None
-    except:
-        ZoneInfo = None
-        pytz = None
+except Exception:
+    ZoneInfo = None
+try:
+    import pytz
+except Exception:
+    pytz = None
 
 import matplotlib
 matplotlib.use("Agg")
@@ -530,10 +530,12 @@ class TrackingOutcome(EpisodeState):
 
         # Check for favorable exit before respect
         if not context.get("exited_favorably", False):
-            if direction == 1 and bar["high"] < (zone["level"] - zone["width"]): # Exited below support
-                context["exited_favorably"] = True
-            elif direction == -1 and bar["low"] > (zone["level"] + zone["width"]): # Exited above resistance
-                context["exited_favorably"] = True
+            if direction == 1:  # SUPPORT: favorable is up
+                if bar["high"] > band_high:
+                    context["exited_favorably"] = True
+            else:               # RESISTANCE: favorable is down
+                if bar["low"] < band_low:
+                    context["exited_favorably"] = True
 
         # 3. Respect: Reversed by R without breaking, after a favorable exit
         if context.get("exited_favorably", False) and respected_now:
@@ -1303,12 +1305,14 @@ def save_daily_maps(df: pd.DataFrame, zones: List[Zone], episodes: List[Dict], o
                 label = outcome.value if hasattr(outcome, "value") else str(outcome)
                 outcome_color = {'RESPECT': 'blue', 'BREAK': 'orange', 'PIERCE_AND_REVERT': 'purple'}.get(label, 'grey')
 
-                # Use searchsorted for robust timestamp lookup
-                touch_idx = df['timestamp'].searchsorted(episode['touch_time'], side='left')
-                if touch_idx < len(df):
-                    touch_price = df['close'].iat[touch_idx]
-                    ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
-                    ax.text(episode['outcome_time'], touch_price, label, color=outcome_color)
+                # Use nearest-bar lookup for robust plotting
+                ix = df['timestamp'].searchsorted(episode['touch_time'])
+                ix = int(np.clip(ix, 1, len(df)-1))
+                cand = df.iloc[[ix-1, ix]]
+                row = cand.iloc[(cand["timestamp"] - episode['touch_time']).abs().values.argmin()]
+                touch_price = row["close"]
+                ax.scatter(episode['touch_time'], touch_price, color=outcome_color, s=50, zorder=5, marker='o')
+                ax.text(episode['outcome_time'], touch_price, label, color=outcome_color)
 
         ax.set_title(f"Market Map for {session.strftime('%Y-%m-%d')}")
         ax.set_ylabel("Price")
@@ -1338,6 +1342,7 @@ def _ensure_utc_timestamps(df: pd.DataFrame) -> pd.DataFrame:
 
 def ensure_prepared(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
     """Checks if data has been prepared, and if not, runs preparation steps."""
+    df = _ensure_utc_timestamps(df) # Make this utility self-contained and robust
     need_sessions = any(c not in df.columns for c in ["session_date","minute_of_day","is_rth","local_time"])
     if need_sessions:
         LOG.info("Input data is missing session columns, running annotate_sessions...")
