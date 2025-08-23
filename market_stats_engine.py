@@ -2565,6 +2565,9 @@ def main():
 
                 pd.DataFrame([dataclasses.asdict(z) for z in all_zones]).to_csv(f"{args.out}/zones.csv", index=False)
                 pd.DataFrame(all_episodes).to_csv(f"{args.out}/episodes.csv", index=False)
+                if HAVE_PARQUET:
+                    pd.DataFrame(all_episodes).to_parquet(f"{args.out}/episodes.parquet", index=False)
+                    pd.DataFrame([dataclasses.asdict(z) for z in all_zones]).to_parquet(f"{args.out}/zones.parquet", index=False)
                 with open(f"{args.out}/statistics.json", "w") as f:
                     json.dump(all_stats_flat, f, indent=2, default=str)
 
@@ -2642,9 +2645,17 @@ def main():
                 )
                 summary_results = [run_sweep_item(arg_tuple) for arg_tuple in iterator]
 
-            pd.DataFrame(summary_results).to_csv(
-                os.path.join(out_dir, "sweep_summary.csv"), index=False
-            )
+            df_summary = pd.DataFrame(summary_results)
+            if "respect_rate" in df_summary.columns and len(df_summary) > 0:
+                baseline = float(df_summary.iloc[0]["respect_rate"])
+                def _h(p, q=baseline):
+                    p = min(max(p, 1e-12), 1-1e-12); q = min(max(q, 1e-12), 1-1e-12)
+                    return 2*(math.asin(math.sqrt(p)) - math.asin(math.sqrt(q)))
+                df_summary["respect_lift"] = df_summary["respect_rate"] - baseline
+                df_summary["cohens_h_vs_baseline"] = df_summary["respect_rate"].apply(_h)
+                df_summary.to_csv(os.path.join(out_dir, "sweep_summary.csv"), index=False)
+            else:
+                df_summary.to_csv(os.path.join(out_dir, "sweep_summary.csv"), index=False)
             LOG.info(
                 f"--- Sweep complete. Summary at {os.path.join(out_dir, 'sweep_summary.csv')} ---"
             )
@@ -2728,7 +2739,7 @@ def run_self_test():
             "high": [p + 0.1 for p in prices],
             "low": [p - 0.1 for p in prices],
             "close": prices,
-            "volume": np.random.randint(100, 1000, size=len(prices)),
+            "volume": rng.integers(100, 1000, size=len(prices)),
         }
     )
 
