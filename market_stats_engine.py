@@ -440,6 +440,8 @@ class SearchingForTouch(EpisodeState):
             context["rsi_at_touch"] = touch_bar.get("rsi")
             context["atr_at_touch"] = touch_bar.get("atr")
             context["rvol_at_touch"] = touch_bar.get("rvol")
+            context["stoch_k_at_touch"] = touch_bar.get("stoch_k")
+            context["stoch_d_at_touch"] = touch_bar.get("stoch_d")
             context["is_rth_at_touch"] = touch_bar.get("is_rth")
             context["minute_of_day_at_touch"] = touch_bar.get("minute_of_day")
 
@@ -590,12 +592,20 @@ class EpisodeDetector:
                     "max_adverse": context["max_adverse"],
                     "from_above": context["from_above"],
                     "end_idx": i,
-                    # Add enriched context
+                    # Add enriched context at touch
                     "rsi_at_touch": context.get("rsi_at_touch"),
                     "atr_at_touch": context.get("atr_at_touch"),
                     "rvol_at_touch": context.get("rvol_at_touch"),
+                    "stoch_k_at_touch": context.get("stoch_k_at_touch"),
+                    "stoch_d_at_touch": context.get("stoch_d_at_touch"),
                     "is_rth_at_touch": context.get("is_rth_at_touch"),
                     "minute_of_day_at_touch": context.get("minute_of_day_at_touch"),
+                    # Add enriched context at outcome
+                    "rsi_at_outcome": bar.get("rsi"),
+                    "atr_at_outcome": bar.get("atr"),
+                    "rvol_at_outcome": bar.get("rvol"),
+                    "stoch_k_at_outcome": bar.get("stoch_k"),
+                    "stoch_d_at_outcome": bar.get("stoch_d"),
                 }
 
             if next_state is None:
@@ -934,6 +944,15 @@ def add_indicators(df: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
     else:
         df["rvol"] = np.nan
 
+    # --- Stochastic %K and %D ---
+    n = config.stoch_n
+    d = config.stoch_d
+    lowest_low = df["low"].rolling(window=n, min_periods=1).min()
+    highest_high = df["high"].rolling(window=n, min_periods=1).max()
+    denom = (highest_high - lowest_low).replace(0, np.nan)  # avoid /0
+    df["stoch_k"] = ((df["close"] - lowest_low) / denom * 100).clip(0, 100)
+    df["stoch_d"] = df["stoch_k"].rolling(window=d, min_periods=1).mean()
+
     # Add more indicators as needed...
     return df
 
@@ -1022,10 +1041,23 @@ def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
         except (ValueError, TypeError):
             episodes_df['rvol_tercile'] = "n/a"
 
+        # Stochastic buckets at touch
+        try:
+            episodes_df["stoch_tercile"] = pd.qcut(
+                episodes_df["stoch_k_at_touch"].rank(method="first"), 3, labels=["low", "mid", "high"]
+            )
+        except (ValueError, TypeError):
+            episodes_df["stoch_tercile"] = "n/a"
+
+        episodes_df["stoch_overbought_touch"] = episodes_df["stoch_k_at_touch"] >= 80
+        episodes_df["stoch_oversold_touch"]   = episodes_df["stoch_k_at_touch"] <= 20
+
         strata = {
             "all": episodes_df,
             "rth": episodes_df[episodes_df["is_rth_at_touch"] == True],
             "eth": episodes_df[episodes_df["is_rth_at_touch"] == False],
+            "stoch_ge80": episodes_df[episodes_df["stoch_overbought_touch"]],
+            "stoch_le20": episodes_df[episodes_df["stoch_oversold_touch"]],
         }
 
         for hour, group in episodes_df.groupby('hour_at_touch'):
@@ -1037,6 +1069,9 @@ def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
 
         for tercile, group in episodes_df.groupby('rvol_tercile'):
             strata[f"rvol_{tercile}"] = group
+
+        for tercile, group in episodes_df.groupby('stoch_tercile'):
+            strata[f"stoch_{tercile}"] = group
 
         stratified_stats = {
             name: compute_statistics(data.to_dict('records'), config)
