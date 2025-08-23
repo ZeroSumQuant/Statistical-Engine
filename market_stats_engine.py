@@ -704,14 +704,16 @@ class DataValidator:
                 mad = df.groupby("session_date")["returns"].transform(
                     lambda x: (x - x.median()).abs().median()
                 )
-                outlier_threshold = (
-                    self.config.outlier_std_threshold * mad * 1.4826 + 1e-9
-                )
+                # floor to a tiny positive value to avoid zero-MAD blowups
+                mad = mad.replace(0, np.nan)
+                mad = mad.fillna(df["returns"].mad())  # global MAD fallback
+                outlier_threshold = self.config.outlier_std_threshold * mad * 1.4826 + 1e-9
                 outliers = df["returns"].abs() > outlier_threshold
             else:
-                outlier_threshold = (
-                    df["returns"].std() * self.config.outlier_std_threshold
-                )
+                sigma = df["returns"].std()
+                if not np.isfinite(sigma) or sigma == 0:
+                    sigma = df["returns"].mad() * 1.4826 or 1e-6
+                outlier_threshold = sigma * self.config.outlier_std_threshold
                 outliers = df["returns"].abs() > outlier_threshold
             report["outliers"] = outliers.sum()
             if outliers.any():
@@ -1807,7 +1809,7 @@ def compute_cvar(data: np.ndarray, alpha: float = 0.95) -> Optional[float]:
         # ensure at least one element in the tail
         return float(a[k:].mean() if k < len(a) else a[-1])
     var = np.percentile(a, alpha * 100)
-    tail = a[a > var]
+    tail = a[a >= var]
     return float(tail.mean() if tail.size else var)
 
 
@@ -1863,6 +1865,9 @@ def compute_statistics(
 ) -> Dict[str, Any]:
     """Compute statistics with proper confidence intervals"""
     valid_episodes = [e for e in episodes if e["outcome"] != EpisodeOutcome.INVALID]
+    valid_episodes = sorted(
+        valid_episodes, key=lambda e: e.get("touch_time") or e.get("outcome_time")
+    )
     n_invalid, n_episodes = len(episodes) - len(valid_episodes), len(valid_episodes)
 
     stats = {
@@ -1990,8 +1995,8 @@ class SQLitePersistence:
             run_uuid TEXT NOT NULL UNIQUE,
             run_timestamp TEXT NOT NULL,
             command TEXT,
+            args_json TEXT,
             config_json TEXT,
-            engine_config_json TEXT,
             data_hashes_json TEXT
         )"""
         )
@@ -2035,7 +2040,7 @@ class SQLitePersistence:
     def insert_run(self, metadata: Dict) -> int:
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO runs (run_uuid, run_timestamp, command, config_json, engine_config_json, data_hashes_json) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO runs (run_uuid, run_timestamp, command, args_json, config_json, data_hashes_json) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 metadata["run_uuid"],
                 metadata["run_timestamp_utc"],
@@ -2194,7 +2199,7 @@ def save_daily_maps(
 
     map_count = 0
     # Process sessions in reverse to get the most recent maps first
-    for session, day_df in reversed(list(df.groupby("session_date"))):
+    for session, day_df in sorted(df.groupby("session_date"), key=lambda x: x[0], reverse=True):
         if map_count >= max_maps:
             LOG.info(f"Reached max_maps limit ({max_maps}), stopping map generation.")
             break
@@ -3010,10 +3015,10 @@ def run_sweep_item(args_tuple):
     update_dataclass_from_dict(run_config, params)
 
     # Derive a deterministic, unique seed for this sweep item to ensure reproducibility
-    base_seed = run_config.random_seed or 0
-    param_hash = hash(json.dumps(params, sort_keys=True))
-    item_seed = (base_seed ^ param_hash) & 0xFFFFFFFF
-    run_config.random_seed = int(item_seed)
+    param_bytes = json.dumps(params, sort_keys=True).encode()
+    param_hash = int(hashlib.sha256(param_bytes).hexdigest()[:8], 16)  # 32-bit-ish
+    item_seed = (int(run_config.random_seed or 0) ^ param_hash) & 0xFFFFFFFF
+    run_config.random_seed = item_seed
     np.random.seed(run_config.random_seed)
 
     persistence = SQLitePersistence(db_path) if db_path else None
@@ -3068,7 +3073,7 @@ def run_sweep_item(args_tuple):
             if len(y) > 0 and len(base_y_list) > 0:
                 base_y = np.asarray(base_y_list, float)
                 diff, ci, p = bootstrap_risk_difference(
-                    y, base_y, block_size=block_size, seed=run_config.random_seed
+                    y, base_y, block_size=_blk(run_config), seed=run_config.random_seed
                 )
                 summary_row.update(
                     {
