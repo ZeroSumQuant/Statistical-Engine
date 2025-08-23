@@ -318,6 +318,7 @@ class EpisodeConfig:
     min_bars_between_touches: int = 0
     max_episodes_per_zone: Optional[int] = None
     outliers_policy: str = "invalidate"  # "invalidate" | "skip"
+    censor_on_session_change: bool = True
 
     def __post_init__(self):
         if self.R <= 0:
@@ -477,6 +478,42 @@ def block_bootstrap_ci(
     return float(np.percentile(bootstrap_stats, 100 * alpha / 2)), float(
         np.percentile(bootstrap_stats, 100 * (1 - alpha / 2))
     )
+
+
+def block_bootstrap_prop_ci(
+    x: np.ndarray,  # 0/1 vector
+    n_boot: int = 4000,
+    block_size: int = BOOTSTRAP_BLOCK_SIZE,
+    alpha: float = 0.05,
+    seed: Optional[int] = None,
+) -> Tuple[float, float]:
+    """
+    Moving-block bootstrap CI for a proportion (handles autocorrelation).
+    """
+    if len(x) == 0:
+        return (np.nan, np.nan)
+    # Fallback to Jeffreys only when too short for blocks
+    if len(x) < max(8, block_size):
+        k = int(x.sum()); n = int(len(x))
+        if HAVE_SCIPY:
+            from scipy.stats import beta
+            return float(beta.ppf(alpha/2, k+0.5, n-k+0.5)), float(beta.ppf(1-alpha/2, k+0.5, n-k+0.5))
+        # vanilla percentile bootstrap as last resort
+        return standard_bootstrap_ci(x, np.mean, n_boot=n_boot, alpha=alpha, seed=seed)
+
+    rng = np.random.default_rng(seed)
+    n = len(x)
+    z = np.concatenate([x, x[:block_size-1]])
+    stats = []
+    for _ in range(n_boot):
+        nb = math.ceil(n / block_size)
+        starts = rng.integers(0, n, size=nb)
+        idx = np.concatenate([np.arange(s, s+block_size) for s in starts])[:n]
+        stats.append(z[idx].mean())
+    stats = np.sort(np.asarray(stats))
+    lo = stats[int(np.floor((alpha/2) * len(stats)))]
+    hi = stats[int(np.floor((1 - alpha/2) * len(stats)))]
+    return float(lo), float(hi)
 
 
 def standard_bootstrap_ci(
@@ -1195,6 +1232,14 @@ class TrackingOutcome(EpisodeState):
             and context["max_favorable"] >= config["R"]
         ):
             return EpisodeOutcome.RESPECT, None
+        # Censor when the bar crosses the touch session boundary (optional)
+        if config.get("censor_on_session_change", True):
+            if context.get("touch_idx") is not None:
+                touch_sess = context["df"].iloc[context["touch_idx"]]["session_date"]
+                if bar.get("session_date", touch_sess) != touch_sess:
+                    return (EpisodeOutcome.TIMEOUT if not config.get("treat_timeout_as_break", False)
+                            else EpisodeOutcome.BREAK), None
+
         if (context["current_idx"] - context["touch_idx"]) >= config["T"]:
             return (
                 EpisodeOutcome.BREAK
@@ -1525,27 +1570,50 @@ def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
     return all_results
 
 
-def compute_survival_analysis(
-    bars_to_outcome: np.ndarray, config: EngineConfig
-) -> Dict[str, Any]:
-    """Computes survival curve and median time to outcome."""
-    times, counts = np.unique(bars_to_outcome, return_counts=True)
-    cumulative_counts = np.cumsum(counts)
-    survival_prob = 1.0 - cumulative_counts / len(bars_to_outcome)
+def km_survival(times: np.ndarray, event_observed: np.ndarray) -> Dict[str, Any]:
+    """
+    Basic Kaplan–Meier estimator.
+    times: integer bars to outcome or censor time
+    event_observed: 1 if outcome occurred (non-timeout break/respect/p&r), 0 if right-censored
+    """
+    if len(times) == 0:
+        return {"curve": {"t": [], "s": []}, "median": np.nan}
+    # Sort by time
+    order = np.argsort(times)
+    t = times[order]
+    e = event_observed[order]
 
-    if 0 not in times:
-        times = np.insert(times, 0, 0)
-        survival_prob = np.insert(survival_prob, 0, 1.0)
-    else:
-        survival_prob = np.insert(survival_prob[:-1], 0, 1.0)
+    uniq, idx = np.unique(t, return_index=True)
+    n = len(t)
+    at_risk = n
+    surv = 1.0
+    s_vals = []
+    t_vals = []
 
-    return {
-        "median_bars_to_outcome": float(np.median(bars_to_outcome)),
-        "median_bars_to_outcome_ci": block_bootstrap_ci(
-            bars_to_outcome, np.median, seed=config.random_seed
-        ),
-        "curve": {"t": times.tolist(), "s": survival_prob.tolist()},
-    }
+    # Iterate unique times
+    for j, start in enumerate(idx):
+        tj = uniq[j]
+        end = idx[j+1] if j+1 < len(idx) else len(t)
+        # events and censored at time tj
+        d = int(e[start:end].sum())
+        c = int((1 - e[start:end]).sum())
+        if at_risk > 0:
+            if d > 0:
+                surv *= (1 - d / at_risk)
+            s_vals.append(surv)
+            t_vals.append(int(tj))
+            at_risk -= (d + c)
+        else:
+            break
+
+    # median time to event (first time S<=0.5)
+    median = np.nan
+    for tt, ss in zip(t_vals, s_vals):
+        if ss <= 0.5:
+            median = tt
+            break
+
+    return {"curve": {"t": t_vals, "s": s_vals}, "median": median}
 
 
 def compute_cvar(data: np.ndarray, alpha: float = 0.95) -> Optional[float]:
@@ -1645,23 +1713,13 @@ def compute_statistics(
             count / n_episodes if n_episodes > 0 else 0
         )
 
-    if n_episodes >= MIN_EPISODES_FOR_STATS and HAVE_SCIPY:
-        from scipy.stats import beta
-
-        for outcome_str, rate in stats["outcome_rates"].items():
-            k = stats["outcome_distribution"][outcome_str]
-            n = n_episodes
-            if n > 0:
-                if k == 0:
-                    ci_low = 0.0
-                    ci_high = beta.ppf(1 - alpha / 2, 0.5, n + 0.5)
-                elif k == n:
-                    ci_low = beta.ppf(alpha / 2, n + 0.5, 0.5)
-                    ci_high = 1.0
-                else:
-                    ci_low = beta.ppf(alpha / 2, k + 0.5, n - k + 0.5)
-                    ci_high = beta.ppf(1 - alpha / 2, k + 0.5, n - k + 0.5)
-                stats["outcome_rates_ci"][outcome_str] = (ci_low, ci_high)
+    # Dependence-aware CIs for outcome rates via block bootstrap
+    for outcome_str, rate in stats["outcome_rates"].items():
+        y = np.array([(1 if (e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"]) == outcome_str else 0)
+                      for e in valid_episodes], dtype=float)
+        stats["outcome_rates_ci"][outcome_str] = block_bootstrap_prop_ci(
+            y, n_boot=3000, block_size=max(5, config.episode.T // 2), alpha=alpha, seed=config.random_seed
+        )
 
     for metric_name in ["bars_to_outcome", "max_favorable", "max_adverse"]:
         data = np.array(
@@ -1690,11 +1748,22 @@ def compute_statistics(
                 ),
             }
 
-    bars_to_outcome = np.array(
-        [e["bars_to_outcome"] for e in valid_episodes if "bars_to_outcome" in e]
-    )
-    if len(bars_to_outcome) > 0:
-        stats["survival_analysis"] = compute_survival_analysis(bars_to_outcome, config)
+    bars = []; observed = []
+    for e in valid_episodes:
+        if "bars_to_outcome" not in e: continue
+        bars.append(int(e["bars_to_outcome"]))
+        # censor if timeout
+        o = e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"]
+        observed.append(0 if o == EpisodeOutcome.TIMEOUT.value else 1)
+    bars = np.asarray(bars, dtype=int)
+    observed = np.asarray(observed, dtype=int)
+
+    if len(bars) > 0:
+        km = km_survival(bars, observed)
+        stats["survival_analysis"] = {
+            "median_bars_to_outcome": float(km["median"]) if km["median"] == km["median"] else None,
+            "curve": km["curve"],
+        }
 
     adverse_excursions = np.array(
         [e["max_adverse"] for e in valid_episodes if "max_adverse" in e]
@@ -2321,6 +2390,10 @@ def main():
         config.random_seed = args.seed
         LOG.info(f"Using random seed: {config.random_seed}")
 
+    # Deterministic RNG
+    if config.random_seed is not None:
+        np.random.seed(config.random_seed)
+
     if hasattr(args, "regimes") and args.regimes and os.path.exists(args.regimes):
         if not HAVE_YAML:
             raise ImportError("pyyaml is required for --regimes. `pip install pyyaml`")
@@ -2368,6 +2441,11 @@ def main():
             out_dir = str(Path(args.out).parent)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
+        # File logging
+        fh = logging.FileHandler(os.path.join(out_dir, "log.txt"))
+        fh.setFormatter(formatter)
+        LOG.addHandler(fh)
+
         base_metadata = {
             "run_uuid": str(uuid.uuid4()),
             "run_timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -2388,6 +2466,16 @@ def main():
         with open(os.path.join(out_dir, "run_metadata.json"), "w") as f:
             json.dump(base_metadata, f, indent=2, default=str)
         LOG.info(f"Saved run metadata to {os.path.join(out_dir, 'run_metadata.json')}")
+
+        manifest = {
+            "code_sha256": base_metadata["code_sha256"],
+            "config_sha256": hashlib.sha256(json.dumps(base_metadata["config"], sort_keys=True, default=str).encode()).hexdigest(),
+            "data_sha256": base_metadata["data_sha256"],
+            "run_uuid": base_metadata["run_uuid"],
+            "timestamp_utc": base_metadata["run_timestamp_utc"],
+        }
+        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
 
         if args.command == "prepare":
             df_iter = (
@@ -2625,11 +2713,12 @@ def run_self_test():
     )
     price = 102.0
     prices = []
+    rng = np.random.default_rng(42)
     for i, ts in enumerate(timestamps):
-        if 50 < i < 100 and np.random.random() > 0.5:
-            price = max(100.0, price - np.random.uniform(0, 1) * 0.25)
+        if 50 < i < 100 and rng.random() > 0.5:
+            price = max(100.0, price - rng.uniform(0, 1) * 0.25)
         else:
-            price += np.random.uniform(-1, 1) * 0.25
+            price += rng.uniform(-1, 1) * 0.25
         prices.append(price)
 
     df = pd.DataFrame(
