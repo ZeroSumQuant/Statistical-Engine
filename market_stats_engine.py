@@ -242,7 +242,7 @@ class DataValidator:
             "invalid_ohlc": 0,
             "outliers": 0,
             "gaps_detected": 0,
-            "negative_volume": 0
+            "low_volume": 0
         }
 
         if self.config.check_ohlc_integrity:
@@ -271,9 +271,9 @@ class DataValidator:
         # Volume validation
         if self.config.min_volume > 0:
             invalid_vol = df["volume"] < self.config.min_volume
-            report["negative_volume"] = invalid_vol.sum()
+            report["low_volume"] = invalid_vol.sum()
             if invalid_vol.any():
-                LOG.warning(f"Removing {invalid_vol.sum()} bars with volume < {self.config.min_volume}")
+                LOG.warning(f"Removing {report['low_volume']} bars with volume < {self.config.min_volume}")
                 df = df[~invalid_vol].copy()
 
         # Outlier detection
@@ -1042,6 +1042,8 @@ def run_analysis(df: pd.DataFrame, config: EngineConfig) -> Dict[str, Any]:
             episodes_df['rvol_tercile'] = "n/a"
 
         # Stochastic buckets at touch
+        episodes_df["stoch_k_at_touch"] = pd.to_numeric(episodes_df["stoch_k_at_touch"], errors="coerce")
+        episodes_df["stoch_d_at_touch"] = pd.to_numeric(episodes_df["stoch_d_at_touch"], errors="coerce")
         try:
             episodes_df["stoch_tercile"] = pd.qcut(
                 episodes_df["stoch_k_at_touch"].rank(method="first"), 3, labels=["low", "mid", "high"]
@@ -1137,8 +1139,8 @@ def compute_statistics(episodes: List[Dict], config: EngineConfig, alpha: float 
             stats["outcome_rates_ci"][outcome.value] = (None, None)
 
     # --- Bootstrap CIs for metrics ---
-    if n_episodes >= MIN_EPISODES_FOR_STATS:
-        metrics_to_bootstrap = ["bars_to_outcome", "max_favorable", "max_adverse"]
+    metrics_to_bootstrap = ["bars_to_outcome", "max_favorable", "max_adverse"]
+    if n_episodes >= 2:  # Need at least 2 data points for bootstrap
         for metric_name in metrics_to_bootstrap:
             data = np.array([e[metric_name] for e in valid_episodes if e.get(metric_name) is not None])
             if len(data) > 1:
@@ -1313,7 +1315,7 @@ def ensure_prepared(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
         LOG.info("Input data is missing session columns, running annotate_sessions...")
         df = annotate_sessions(df, config.session)
 
-    need_ind = any(c not in df.columns for c in ["atr","rsi","rvol"])
+    need_ind = any(c not in df.columns for c in ["atr", "rsi", "rvol", "stoch_k", "stoch_d"])
     if need_ind:
         LOG.info("Input data is missing indicator columns, running add_indicators...")
         df = add_indicators(df, config.indicators)
@@ -1451,8 +1453,9 @@ def main():
         # Save episodes
         episodes_df = pd.DataFrame(results["episodes"])
         if not episodes_df.empty:
-            # Convert Enum to string for CSV
-            episodes_df["outcome"] = episodes_df["outcome"].apply(lambda x: x.value)
+            # Convert Enums to string values for clean CSV export
+            episodes_df["outcome"] = episodes_df["outcome"].apply(lambda x: x.value if hasattr(x, "value") else x)
+            episodes_df["zone_type"] = episodes_df["zone_type"].apply(lambda x: x.value if hasattr(x, "value") else x)
         episodes_df.to_csv(f"{args.out}/episodes.csv", index=False)
 
         # Save statistics
