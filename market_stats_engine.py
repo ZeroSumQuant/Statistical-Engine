@@ -213,7 +213,6 @@ MAX_GAP_MINUTES = 120  # Max gap before considering session break
 
 # Statistical thresholds
 MIN_EPISODES_FOR_STATS = 30  # Minimum episodes for reliable statistics
-ZONE_SIGNIFICANCE_ALPHA = 0.05  # Significance level for zone detection
 BOOTSTRAP_BLOCK_SIZE = 10  # Block size for correlated bootstrap
 
 ##############################################################################
@@ -292,6 +291,7 @@ class ZoneConfig:
     max_cluster_span_days: Optional[int] = None
     min_touches_for_significance: int = 2
     significance_test: bool = True
+    alpha: float = 0.05
 
     def __post_init__(self):
         if self.pivot_k < 1:
@@ -319,7 +319,7 @@ class EpisodeConfig:
     first_touch_only: bool = False
     min_bars_between_touches: int = 0
     max_episodes_per_zone: Optional[int] = None
-    outliers_policy: str = "invalidate"  # "invalidate" | "skip"
+    outliers_policy: str = "skip"  # "invalidate" | "skip"
     censor_on_session_change: bool = True
 
     def __post_init__(self):
@@ -406,7 +406,7 @@ def test_zone_significance(
     level: float,
     width: float,
     local_prices: pd.Series,
-    alpha: float = ZONE_SIGNIFICANCE_ALPHA,
+    alpha: float = 0.05,
 ) -> Tuple[bool, float]:
     """
     Tests zone significance using a binomial test.
@@ -634,8 +634,11 @@ def _ensure_utc_timestamps(df: pd.DataFrame, config: EngineConfig) -> pd.DataFra
     if "timestamp" not in df.columns:
         raise ValueError("DataFrame must have a 'timestamp' column.")
 
+    # Handle object dtype / mixed tz edge-case
+    if df["timestamp"].dtype == "O":
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
     # Normalize to datetime first, preserving tz if present; coerce invalids
-    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+    elif not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
 
     # If any tz-aware values exist, convert entire column to UTC
@@ -885,9 +888,15 @@ def annotate_regimes(df: pd.DataFrame, regime_config: RegimeConfig) -> pd.DataFr
             df[col_name] = mask.astype(bool)
             LOG.debug(f"Annotated regime '{regime.name}' ({mask.sum()} bars)")
         except Exception as e:
-            LOG.error(
-                f"Failed to evaluate regime '{regime.name}': {regime.condition}. Error: {e}"
-            )
+            log_msg = f"Failed to evaluate regime '{regime.name}': {regime.condition}. Error: {e}"
+            # Try to extract missing column name for better debugging
+            if isinstance(e, NameError) and "is not defined" in str(e):
+                try:
+                    missing_col = str(e).split("'")[1]
+                    log_msg += f" (Hint: missing column '{missing_col}'?)"
+                except IndexError:
+                    pass  # could not parse
+            LOG.error(log_msg)
             df[col_name] = False
     return df
 
@@ -945,6 +954,8 @@ def merge_close_zones(zones: List["Zone"], tolerance: float) -> List["Zone"]:
         if abs(current_zone.level - prev_zone.level) <= tolerance:
             total_touches = len(prev_zone.touches) + len(current_zone.touches)
             if total_touches == 0:
+                # Keep both zones; append current instead of skipping
+                merged_zones.append(current_zone)
                 continue
             new_level = (
                 (prev_zone.level * len(prev_zone.touches))
@@ -1028,6 +1039,7 @@ def detect_zones_from_pivots(
                         level,
                         width_for_test,
                         pd.concat([local_prices_df["high"], local_prices_df["low"]]),
+                        alpha=config.alpha,
                     )
 
             activation_time = (
@@ -1137,6 +1149,7 @@ def detect_zones_from_csv(
                     level,
                     width_for_test,
                     pd.concat([local_prices_df["high"], local_prices_df["low"]]),
+                    alpha=config.alpha,
                 )
 
         candidate_zones.append(
@@ -1470,7 +1483,7 @@ def discover_zones(df: pd.DataFrame, config: EngineConfig, regime_name: str) -> 
         p_values = [z.p_value for z in all_candidate_zones]
         if HAVE_STATSMODELS:
             reject, _, _, _ = multipletests(
-                p_values, alpha=ZONE_SIGNIFICANCE_ALPHA, method="fdr_bh"
+                p_values, alpha=config.zones.alpha, method="fdr_bh"
             )
             significant_zones = [
                 zone for zone, is_sig in zip(all_candidate_zones, reject) if is_sig
@@ -1482,7 +1495,7 @@ def discover_zones(df: pd.DataFrame, config: EngineConfig, regime_name: str) -> 
             significant_zones = [
                 zone
                 for zone in all_candidate_zones
-                if zone.p_value < ZONE_SIGNIFICANCE_ALPHA
+                if zone.p_value < config.zones.alpha
             ]
     else:
         significant_zones = all_candidate_zones
@@ -2225,16 +2238,19 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
     plt.savefig(os.path.join(out_dir, f"dist_outcomes_{regime_name}.png"))
     plt.close()
 
-    plt.figure(figsize=(10, 6))
-    q = episodes_df["bars_to_outcome"].quantile(0.99)
-    q = float(q) if np.isfinite(q) and q > 0 else episodes_df["bars_to_outcome"].max()
-    episodes_df["bars_to_outcome"].hist(bins=50, range=(0, q))
-    plt.title(f"Distribution of Bars to Outcome (Regime: {regime_name})")
-    plt.xlabel("Number of Bars to Outcome (bars)")
-    plt.ylabel("Frequency")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"dist_bars_to_outcome_{regime_name}.png"))
-    plt.close()
+    bt = episodes_df["bars_to_outcome"].dropna()
+    if not bt.empty:
+        plt.figure(figsize=(10, 6))
+        q = float(bt.quantile(0.99))
+        if not np.isfinite(q) or q <= 0:
+            q = float(bt.max()) if np.isfinite(bt.max()) else 0.0
+        bt.hist(bins=50, range=(0, max(q, 0.0)))
+        plt.title(f"Distribution of Bars to Outcome (Regime: {regime_name})")
+        plt.xlabel("Number of Bars to Outcome (bars)")
+        plt.ylabel("Frequency")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"dist_bars_to_outcome_{regime_name}.png"))
+        plt.close()
 
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
@@ -2582,6 +2598,14 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         for res in all_results.values()
         for st in res.get("statistics", {}).values()
     )
+
+    if not has_q:
+        html += '''
+        <div style="background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; padding: 1rem; margin-bottom: 1rem; border-radius: .25rem;">
+            <strong>Warning: Unadjusted p-values.</strong> The <code>statsmodels</code> library was not found, so p-values for cohort comparisons have not been adjusted for multiple comparisons (e.g., via FDR). Please interpret these results with caution.
+        </div>
+        '''
+
     block_size_str = (
         str(config.bootstrap_block_size)
         if config.bootstrap_block_size is not None
@@ -2630,7 +2654,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
             </table>
 
             <h3>Comparative Cohort Analysis</h3>
-            <p>The following cohorts showed a statistically significant difference in respect rate compared to the baseline after FDR correction (q < {ZONE_SIGNIFICANCE_ALPHA}).</p>
+            <p>The following cohorts showed a statistically significant difference in respect rate compared to the baseline after FDR correction (q < {config.zones.alpha}).</p>
             <table>
                 <tr>
                     <th>Cohort</th>
@@ -2686,6 +2710,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
 
             <h3>Outcome & Excursion Distributions</h3>
             {embed_img(os.path.join(out_dir, "charts", f'dist_outcomes_{regime_name}.png'))}
+            {embed_img(os.path.join(out_dir, "charts", f'dist_bars_to_outcome_{regime_name}.png'))}
             {embed_img(os.path.join(out_dir, "charts", f'dist_excursions_{regime_name}.png'))}
             {embed_img(os.path.join(out_dir, "charts", f'respect_rate_ci_{regime_name}.png'))}
 
@@ -2932,6 +2957,10 @@ def main():
             LOG.error(f"Failed to load or parse regime config: {e}", exc_info=True)
             # Decide if we should exit or just continue without regimes
             LOG.warning("Continuing analysis without market regimes due to config error.")
+
+    if args.command == "analyze" and args.wf and args.report:
+        LOG.warning("The --report flag is for in-sample analysis only and will be ignored for walk-forward validation.")
+        args.report = False
 
     if hasattr(args, "engine") and args.engine == "fast": # Not used yet
         if HAVE_POLARS:
@@ -3550,6 +3579,11 @@ def run_self_test():
         assert "first_half" in all_results, "Self-test failed: 'first_half' regime missing."
         assert len(all_results["first_half"]["zones"]) > 0, "Self-test failed: No zones in first_half."
         assert len(all_results["first_half"]["episodes"]) > 0, "Self-test failed: No episodes in first_half."
+        assert "second_half" in all_results, "Self-test failed: 'second_half' regime missing."
+        assert "zones" in all_results["second_half"], "Self-test failed: 'zones' key missing for second_half."
+        if not all_results["second_half"]["zones"]:
+            LOG.info("Self-test: second_half regime generated no zones, which is an acceptable outcome for this test.")
+        assert "episodes" in all_results["second_half"], "Self-test failed: 'episodes' key missing in second_half results."
         LOG.info(f"--- SELF-TEST OK --- (Artifacts in {out_dir})")
     except AssertionError as e:
         LOG.error(f"--- SELF-TEST FAILED: {e} ---", exc_info=True)
