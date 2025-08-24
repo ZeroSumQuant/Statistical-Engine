@@ -414,7 +414,7 @@ def test_zone_significance(
     """
     n = len(touches)
     if n < 2:
-        return True, 1.0  # Not enough data to test, default to significant
+        return False, 1.0  # Not enough data to test; p=1.0 ensures it's filtered out
 
     window_pts = local_prices.max() - local_prices.min()
     if window_pts <= 0:
@@ -1278,12 +1278,12 @@ class TrackingOutcome(EpisodeState):
         # Handle outliers first based on policy
         if bar.get("is_outlier", False):
             if config.get("outliers_policy") == "skip":
+                # Advance the episode clock so the next non-outlier bar doesn’t look like a huge gap
+                context["prev_ts"] = bar["timestamp"]
                 LOG.debug(f"Skipping outlier bar at {bar['timestamp']}")
-                return None, self  # Remain in this state, effectively ignoring the bar
+                return None, self
             else:  # Default policy is "invalidate"
-                LOG.debug(
-                    f"Invalidating episode due to outlier bar at {bar['timestamp']}"
-                )
+                LOG.debug(f"Invalidating episode due to outlier bar at {bar['timestamp']}")
                 return EpisodeOutcome.INVALID, None
 
         if (
@@ -2644,24 +2644,26 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
             rr_cohort = stats.get("outcome_rates", {}).get("RESPECT", float('nan'))
             rr_ci = stats.get("outcome_rates_ci", {}).get("RESPECT")
             rd_ci = comp.get("risk_difference_ci")
-            row_q_or_p = (f"{comp['q_value']:.3f}" if has_q else f"p={comp['p_value']:.3f}")
+            sort_key = float(comp['q_value']) if has_q else float(comp.get('p_value', float('inf')))
+            row_q_or_p = (f"{comp['q_value']:.3f}" if has_q else f"p={sort_key:.3f}")
             significant_cohorts.append({
                 "name": name,
                 "n": stats.get("n_episodes"),
                 "rr_str": f"{rr_cohort:.2%} ({_fmt_ci_html(rr_ci)})",
                 "rd_str": f"{comp.get('risk_difference', 0):+.2%} ({_fmt_ci_html(rd_ci)})",
-                "q_value": row_q_or_p,
+                "q_or_p": row_q_or_p,
+                "sort_key": sort_key,
             })
 
         if significant_cohorts:
-            for cohort in sorted(significant_cohorts, key=lambda x: x["q_value"]):
+            for cohort in sorted(significant_cohorts, key=lambda x: x["sort_key"]):
                 html += f"""
                     <tr>
                         <td>{cohort['name']}</td>
                         <td>{cohort['n']}</td>
                         <td>{cohort['rr_str']}</td>
                         <td>{cohort['rd_str']}</td>
-                        <td>{cohort['q_value']}</td>
+                        <td>{cohort['q_or_p']}</td>
                     </tr>
                 """
         else:
