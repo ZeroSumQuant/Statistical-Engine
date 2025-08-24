@@ -629,18 +629,23 @@ def _blk(config: EngineConfig) -> int:
 
 
 def _ensure_utc_timestamps(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
-    """Ensures the timestamp column is a timezone-aware UTC timestamp."""
+    """Ensures df['timestamp'] is tz-aware UTC; handles naive/object/mixed inputs."""
     if "timestamp" not in df.columns:
         raise ValueError("DataFrame must have a 'timestamp' column.")
-    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    if df["timestamp"].dt.tz is None:
-        tz = config.instrument.data_tz or "UTC"
-        LOG.info(f"Timestamp column is timezone-naive, localizing to '{tz}' then converting to UTC.")
-        df["timestamp"] = df["timestamp"].dt.tz_localize(tz).dt.tz_convert("UTC")
-    else:
+    # Normalize to datetime first, preserving tz if present; coerce invalids
+    if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=False)
+
+    # If any tz-aware values exist, convert entire column to UTC
+    if pd.api.types.is_datetime64tz_dtype(df["timestamp"]):
         df["timestamp"] = df["timestamp"].dt.tz_convert("UTC")
+        return df
+
+    # All naive → localize then convert
+    tz = config.instrument.data_tz or "UTC"
+    LOG.info(f"Timestamp column is timezone-naive, localizing to '{tz}' and converting to UTC.")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").dt.tz_localize(tz).dt.tz_convert("UTC")
     return df
 
 
@@ -1551,18 +1556,20 @@ def evaluate_episodes(
                     zone_dict["level"] - zone_dict["width"],
                     zone_dict["level"] + zone_dict["width"],
                 )
-                next_scan_idx = -1
                 if next_scan_idx_candidate >= len(df):
                     break
-                for idx in range(next_scan_idx_candidate, len(df)):
-                    bar = df.iloc[idx]
-                    if bar["timestamp"] > zone_dict["expiry_time"]:
-                        break
-                    if bar["high"] < band_low or bar["low"] > band_high:
-                        next_scan_idx = idx
-                        break
-                if next_scan_idx != -1:
-                    current_scan_idx = next_scan_idx
+                # Vectorized: first index where price is fully outside the band
+                # Limit search to zone expiry to avoid scanning the whole df
+                # (mask slicing is cheap; .to_numpy() avoids Python loop)
+                limit = int(df.index[df["timestamp"] <= zone_dict["expiry_time"]].max()) if \
+                        (df["timestamp"] <= zone_dict["expiry_time"]).any() else len(df) - 1
+                if next_scan_idx_candidate > limit:
+                    break
+                band = ((df["high"] < band_low) | (df["low"] > band_high)).to_numpy()
+                segment = band[next_scan_idx_candidate:limit+1]
+                if segment.any():
+                    offset = int(np.argmax(segment))  # first True
+                    current_scan_idx = next_scan_idx_candidate + offset
                 else:
                     break
             else:
@@ -1583,7 +1590,11 @@ def _run_single_analysis(
     episodes_df = pd.DataFrame(episodes)
     if not episodes_df.empty:
         # --- Create Cohort Columns ---
-        episodes_df["hour_at_touch"] = episodes_df["minute_of_day_at_touch"] // 60
+        episodes_df["hour_at_touch"] = (
+            episodes_df["minute_of_day_at_touch"]
+            .dropna()
+            .astype("int64", errors="ignore") // 60
+        )
         for col in ["atr_at_touch", "rvol_at_touch", "stoch_k_at_touch"]:
             try:
                 episodes_df[f'{col.split("_")[0]}_tercile'] = pd.qcut(
@@ -2591,7 +2602,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         if not all_stats:
             continue
 
-        rr = all_stats.get("outcome_rates", {}).get("RESPECT", float('nan'))
+        rr = all_stats.get("outcome_rates", {}).get("RESPECT", None)
         ci = all_stats.get("outcome_rates_ci", {}).get("RESPECT")
         med = all_stats.get("survival_analysis", {}).get("median_bars_to_outcome", "N/A")
         cvar = all_stats.get("tail_risk", {}).get("cvar_95_adverse_excursion", float('nan'))
@@ -2611,7 +2622,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
                 </tr>
                 <tr>
                     <td>{all_stats.get('n_episodes', 'N/A')}</td>
-                    <td>{rr:.2%} ({_fmt_ci_html(ci)})</td>
+                    <td>{(f'{rr:.2%}' if isinstance(rr, (int,float)) and np.isfinite(rr) else 'N/A')} ({_fmt_ci_html(ci)})</td>
                     <td>{med}</td>
                     <td>{cvar:.2f} points</td>
                 </tr>
