@@ -201,7 +201,8 @@ formatter = logging.Formatter(
     "[%(asctime)s] %(levelname)s [%(funcName)s:%(lineno)d] %(message)s"
 )
 handler.setFormatter(formatter)
-LOG.addHandler(handler)
+if not any(isinstance(h, logging.StreamHandler) for h in LOG.handlers):
+    LOG.addHandler(handler)
 LOG.setLevel(logging.INFO)
 
 # ————————— Constants —————————
@@ -798,12 +799,20 @@ def prepare_data(files: List[str], config: EngineConfig) -> pd.DataFrame:
 
 def annotate_sessions(df: pd.DataFrame, config: InstrumentConfig) -> pd.DataFrame:
     """Add session information based on instrument config"""
+    tz = None
     if ZoneInfo:
-        tz = ZoneInfo(config.session_tz)
+        try:
+            tz = ZoneInfo(config.session_tz)
+        except Exception:
+            LOG.warning(f"Unknown session_tz '{config.session_tz}', falling back to UTC.")
     elif pytz:
-        tz = pytz.timezone(config.session_tz)
-    else:
-        tz = None
+        try:
+            tz = pytz.timezone(config.session_tz)
+        except Exception:
+            LOG.warning(f"Unknown session_tz '{config.session_tz}', falling back to UTC.")
+            tz = None
+
+    if tz is None and not ZoneInfo and not pytz:
         LOG.warning("No timezone library available, using UTC")
 
     df["local_time"] = df["timestamp"].dt.tz_convert(tz) if tz else df["timestamp"]
@@ -834,7 +843,8 @@ def add_indicators(df: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
     df["rsi"] = 100 - (100 / (1 + gain / (loss + 1e-12)))
     if config.rvol_lookback_sessions > 0 and "session_date" in df.columns:
         bars_per_session = int(df.groupby("session_date").size().median())
-        if bars_per_session == 0: bars_per_session = 390 # Fallback for safety
+        if bars_per_session == 0:
+            bars_per_session = 390 # Fallback for safety, e.g., for single-day data.
         rolling_window = max(10, config.rvol_lookback_sessions * bars_per_session)
         df["avg_volume_lookback"] = (
             df["volume"]
@@ -1060,7 +1070,7 @@ def detect_zones_from_csv(
 
     candidate_zones = []
     tick_size = instrument.tick_size
-    for _, row in levels_df.iterrows():
+    for i, row in levels_df.iterrows():
         level = round_to_tick(row["level"], tick_size)
         width = round_to_tick(row["width"], tick_size)
 
@@ -1070,7 +1080,7 @@ def detect_zones_from_csv(
         elif "res" in type_str or type_str.startswith("r"):
             zone_type = ZoneType.RESISTANCE
         else:
-            LOG.warning(f"Skipping external level with unknown type: {row.get('type')}")
+            LOG.warning(f"Row {i}: skipping external level with unknown type: {row.get('type')}")
             continue
 
         activation_time = pd.Timestamp(row["timestamp"], tz="UTC")
@@ -1224,6 +1234,7 @@ class SearchingForTouch(EpisodeState):
             context["touch_idx"] = context["current_idx"]
             context["touch_time"] = bar["timestamp"]
             touch_bar = context["df"].iloc[context["touch_idx"]]
+            context["prev_ts"] = touch_bar["timestamp"]
             for ind in [
                 "rsi",
                 "atr",
@@ -2073,6 +2084,8 @@ class SQLitePersistence:
             FOREIGN KEY(run_fk) REFERENCES runs(run_pk) ON DELETE CASCADE
         )"""
         )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_zones_run_regime ON zones(run_fk, regime);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_eps_run_regime ON episodes(run_fk, regime);")
         self.conn.commit()
 
     def insert_run(self, metadata: Dict) -> int:
@@ -2513,7 +2526,11 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         return f'<img src="data:image/png;base64,{encoded}" alt="{os.path.basename(path)}" style="width:100%; max-width:600px;">'
 
     def _fmt_ci_html(ci_tuple):
-        return "N/A" if not ci_tuple or ci_tuple[0] is None else f"{ci_tuple[0]:.2%} – {ci_tuple[1]:.2%}"
+        if not ci_tuple: return "N/A"
+        lo, hi = ci_tuple
+        if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi):
+            return "N/A"
+        return f"{lo:.2%} – {hi:.2%}"
 
     html = f"""
     <!DOCTYPE html>
@@ -3004,6 +3021,32 @@ def main():
                     # Simplified handling for walk-forward with regimes
                     # We report the aggregate of all OOS episodes regardless of regime
                     agg_results = wf_results["all_data"]
+                    agg_stats = agg_results["aggregated_statistics"]
+
+                    # --- Save OOS Summary and Plots ---
+                    s = agg_stats
+                    rr = s.get("outcome_rates", {}).get("RESPECT", float('nan'))
+                    ci = s.get("outcome_rates_ci", {}).get("RESPECT", (None, None))
+                    med = s.get("survival_analysis", {}).get("median_bars_to_outcome", "N/A")
+                    cvar = s.get("tail_risk", {}).get("cvar_95_adverse_excursion", float('nan'))
+                    summary_data = [{
+                        "regime": "out_of_sample",
+                        "n_episodes": s.get("n_episodes", 0),
+                        "respect_rate": rr,
+                        "respect_rate_ci_low": ci[0] if ci else None,
+                        "respect_rate_ci_high": ci[1] if ci else None,
+                        "median_bars_to_outcome": med,
+                        "cvar_95_adverse_excursion": cvar,
+                    }]
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_csv(os.path.join(args.out, "summary_oos.csv"), index=False, float_format="%.4f")
+                    LOG.info(f"Saved OOS summary metrics to {os.path.join(args.out, 'summary_oos.csv')}")
+
+                    if not getattr(args, "no_plots", False):
+                        charts_dir = os.path.join(args.out, "charts")
+                        Path(charts_dir).mkdir(parents=True, exist_ok=True)
+                        save_respect_rate_ci_plot({"all": agg_stats}, charts_dir, "out_of_sample")
+
                     with open(f"{args.out}/statistics_walkforward.json", "w") as f:
                         json.dump(
                             agg_results["aggregated_statistics"], f, indent=2, default=str
@@ -3034,7 +3077,7 @@ def main():
                         persistence.insert_episodes(
                             run_pk, agg_results["all_oos_episodes"]
                         )
-                    agg_stats = agg_results["aggregated_statistics"]
+
                     if agg_stats["n_episodes"] > 0:
                         respect_rate = agg_stats["outcome_rates"].get("RESPECT", 0.0)
                         ci = agg_stats["outcome_rates_ci"].get("RESPECT", (None, None))
