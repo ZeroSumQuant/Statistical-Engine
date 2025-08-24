@@ -724,7 +724,8 @@ class DataValidator:
             else:
                 sigma = df["returns"].std()
                 if not np.isfinite(sigma) or sigma == 0:
-                    sigma = df["returns"].mad() * 1.4826 or 1e-6
+                    mad = (df["returns"] - df["returns"].mean()).abs().mean()
+                    sigma = (mad * 1.4826) or 1e-6
                 outlier_threshold = sigma * self.config.outlier_std_threshold
                 outliers = df["returns"].abs() > outlier_threshold
             report["outliers"] = outliers.sum()
@@ -1059,8 +1060,11 @@ def detect_zones_from_csv(
 
     LOG.info(f"Loading external levels from {path}")
     try:
-        levels_df = pd.read_csv(path, parse_dates=["timestamp"])
+        levels_df = pd.read_csv(path)
         levels_df.columns = [c.lower() for c in levels_df.columns]
+        if "timestamp" not in levels_df.columns:
+            raise ValueError("External levels CSV must contain a 'timestamp' column.")
+        levels_df["timestamp"] = pd.to_datetime(levels_df["timestamp"], errors="coerce", utc=False)
         required = ["timestamp", "level", "type", "width"]
         if any(c not in levels_df.columns for c in required):
             raise ValueError(f"External levels CSV must contain columns: {required}")
@@ -1083,7 +1087,14 @@ def detect_zones_from_csv(
             LOG.warning(f"Row {i}: skipping external level with unknown type: {row.get('type')}")
             continue
 
-        activation_time = pd.Timestamp(row["timestamp"], tz="UTC")
+        ts = row["timestamp"]
+        if pd.isna(ts):
+            LOG.warning(f"Row {i}: skipping external level with invalid timestamp.")
+            continue
+        if ts.tzinfo is None:
+            tz_in = instrument.data_tz or "UTC"
+            ts = pd.Timestamp(ts).tz_localize(tz_in).tz_convert("UTC")
+        activation_time = ts
 
         touch_df = df[df["timestamp"] >= activation_time]
         touches = []
@@ -2487,9 +2498,8 @@ def save_cohort_lift_plot(statistics: Dict[str, Any], out_dir: str, regime_name:
     df = pd.DataFrame(top_n).set_index("name")
 
     plt.figure(figsize=(10, 8))
-    df["lift"].plot(
-        kind="barh", color=df["lift"].apply(lambda x: "C0" if x > 0 else "C1")
-    )
+    colors = ["C0" if x > 0 else "C1" for x in df["lift"].tolist()]
+    df["lift"].plot(kind="barh", color=colors)
     plt.title(f"Top 10 Cohorts by Respect Rate Lift (Regime: {regime_name})")
     plt.xlabel("Lift over Baseline Respect Rate (pp)")
     plt.axvline(0, color="black", linestyle="--")
@@ -2555,20 +2565,11 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         <p class="footer">Generated on {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
     """
     # --- Add Method Notes ---
-    num_tests = 0
-    # Find the number of tests from the first regime that has them
-    for res in all_results.values():
-        stats = res.get("statistics", {})
-        if stats:
-            num_tests = sum(
-                1
-                for cohort in stats.values()
-                if "comparative_respect_rate" in cohort
-                and "q_value" in cohort.get("comparative_respect_rate", {})
-            )
-            if num_tests > 0:
-                break
-
+    has_q = any(
+        "comparative_respect_rate" in st and "q_value" in st["comparative_respect_rate"]
+        for res in all_results.values()
+        for st in res.get("statistics", {}).values()
+    )
     block_size_str = (
         str(config.bootstrap_block_size)
         if config.bootstrap_block_size is not None
@@ -2581,7 +2582,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         <ul>
             <li><b>Censoring Policy:</b> Episodes are censored at session boundaries. Timeouts are treated as <b>{timeout_treatment}</b>.</li>
             <li><b>Bootstrap Block Size:</b> {block_size_str} bars used for CIs.</li>
-            <li><b>Multiple Comparisons:</b> For each regime, {num_tests} cohort respect rates were compared against the baseline. p-values were adjusted for False Discovery Rate (FDR) using the Benjamini/Hochberg method (q-values reported).</li>
+            <li><b>Multiple Comparisons:</b> {"p-values adjusted for FDR (q-values shown)." if has_q else "statsmodels unavailable → unadjusted p-values shown; interpret cautiously."}</li>
         </ul>
     """
 
@@ -2631,17 +2632,26 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         significant_cohorts = []
         for name, stats in results["statistics"].items():
             comp = stats.get("comparative_respect_rate")
-            if comp and comp.get("reject_h0"):
-                rr_cohort = stats.get("outcome_rates", {}).get("RESPECT", float('nan'))
-                rr_ci = stats.get("outcome_rates_ci", {}).get("RESPECT")
-                rd_ci = comp.get("risk_difference_ci")
-                significant_cohorts.append({
-                    "name": name,
-                    "n": stats.get("n_episodes"),
-                    "rr_str": f"{rr_cohort:.2%} ({_fmt_ci_html(rr_ci)})",
-                    "rd_str": f"{comp.get('risk_difference', 0):+.2%} ({_fmt_ci_html(rd_ci)})",
-                    "q_value": f"{comp.get('q_value', 0):.3f}",
-                })
+            if not comp:
+                continue
+
+            is_sig = comp.get("reject_h0") if has_q else (
+                comp.get("p_value") is not None and comp["p_value"] < ZONE_SIGNIFICANCE_ALPHA
+            )
+            if not is_sig:
+                continue
+
+            rr_cohort = stats.get("outcome_rates", {}).get("RESPECT", float('nan'))
+            rr_ci = stats.get("outcome_rates_ci", {}).get("RESPECT")
+            rd_ci = comp.get("risk_difference_ci")
+            row_q_or_p = (f"{comp['q_value']:.3f}" if has_q else f"p={comp['p_value']:.3f}")
+            significant_cohorts.append({
+                "name": name,
+                "n": stats.get("n_episodes"),
+                "rr_str": f"{rr_cohort:.2%} ({_fmt_ci_html(rr_ci)})",
+                "rd_str": f"{comp.get('risk_difference', 0):+.2%} ({_fmt_ci_html(rd_ci)})",
+                "q_value": row_q_or_p,
+            })
 
         if significant_cohorts:
             for cohort in sorted(significant_cohorts, key=lambda x: x["q_value"]):
