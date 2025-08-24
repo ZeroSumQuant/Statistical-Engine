@@ -464,7 +464,10 @@ def block_bootstrap_ci(
     seed: Optional[int] = None,
 ) -> Tuple[float, float]:
     """Circular moving block bootstrap for confidence intervals."""
+    block_size = max(1, int(block_size))
     n = len(data)
+    if n == 0:
+        return (np.nan, np.nan)
     if n < block_size:
         return standard_bootstrap_ci(data, statistic_func, n_boot, alpha, seed=seed)
     rng = np.random.default_rng(seed)
@@ -886,9 +889,14 @@ def annotate_regimes(df: pd.DataFrame, regime_config: RegimeConfig) -> pd.DataFr
     for regime in regime_config.regimes:
         col_name = f"regime_{regime.name.lower().replace(' ', '_')}"
         try:
-            # query returns the filtered frame; convert to boolean mask
-            idx = df.query(regime.condition, engine='python').index
-            mask = df.index.isin(idx)
+            try:
+                # Prefer eval for richer expressions
+                mask = pd.eval(regime.condition, engine='python', target=df, local_dict={"np": np, "pd": pd})
+                mask = pd.Series(mask, index=df.index).astype(bool)
+            except Exception:
+                # Fallback to query for simple column filters
+                idx = df.query(regime.condition, engine='python').index
+                mask = df.index.isin(idx)
             df[col_name] = mask.astype(bool)
             LOG.debug(f"Annotated regime '{regime.name}' ({mask.sum()} bars)")
         except Exception as e:
@@ -1220,23 +1228,22 @@ def cluster_pivots(pivots: List[Dict], config: ZoneConfig) -> List[List[Dict]]:
         return []
     sorted_pivots = sorted(pivots, key=lambda x: x["price"])
     clusters, current_cluster = [], [sorted_pivots[0]]
+    mean_price = current_cluster[0]["price"]
     for pivot in sorted_pivots[1:]:
-        price_is_close = abs(
-            pivot["price"] - np.mean([p["price"] for p in current_cluster])
-        ) <= (config.cluster_width_points or 15.0)
+        price_is_close = abs(pivot["price"] - mean_price) <= (config.cluster_width_points or 15.0)
         time_is_close = (
-            config.max_cluster_span_days is None
-            or (
-                pivot["center_time"] - min(p["center_time"] for p in current_cluster)
-            ).days
-            <= config.max_cluster_span_days
+            config.max_cluster_span_days is None or
+            (pivot["center_time"] - min(p["center_time"] for p in current_cluster)).days <= config.max_cluster_span_days
         )
         if price_is_close and time_is_close:
             current_cluster.append(pivot)
+            # O(1) running mean
+            mean_price += (pivot["price"] - mean_price) / len(current_cluster)
         else:
             if len(current_cluster) >= config.min_touches_for_significance:
                 clusters.append(current_cluster)
             current_cluster = [pivot]
+            mean_price = pivot["price"]
     if len(current_cluster) >= config.min_touches_for_significance:
         clusters.append(current_cluster)
     return clusters
@@ -1309,11 +1316,11 @@ class TrackingOutcome(EpisodeState):
                 LOG.debug(f"Invalidating episode due to outlier bar at {bar['timestamp']}")
                 return EpisodeOutcome.INVALID, None
 
+        gap_allowance = context["bar_dt"] * (config["max_gap_bars"] + 0.5)
         if (
             config["max_gap_bars"] > 0
             and "prev_ts" in context
-            and (context["bar"]["timestamp"] - context["prev_ts"])
-            > (context["bar_dt"] * config["max_gap_bars"])
+            and (context["bar"]["timestamp"] - context["prev_ts"]) > gap_allowance
         ):
             return EpisodeOutcome.INVALID, None
         context["prev_ts"] = context["bar"]["timestamp"]
@@ -2071,6 +2078,7 @@ class SQLitePersistence:
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self.conn.execute("PRAGMA busy_timeout=30000;")
+        self.conn.execute("PRAGMA temp_store=MEMORY;")
         self.conn.execute("PRAGMA foreign_keys = 1;")
         self.create_tables()
 
@@ -2482,6 +2490,10 @@ def run_walk_forward_analysis(
     # might aggregate them per-regime.
     if config.regime_config and config.regime_config.enabled:
         LOG.warning("Regime analysis in walk-forward mode is experimental.")
+        # DEVELOPER NOTE: This is a major simplification. A full implementation would need to
+        # discover zones per-regime in the training set, then evaluate them on the test set
+        # while respecting the regime of the test set bar. The current implementation aggregates
+        # all OOS episodes regardless of the regime they occurred in.
         # This is a simplification. A full implementation would track OOS episodes per regime.
         # For now, we just run on all data for the final report.
         aggregated_stats = compute_statistics(all_oos_episodes, config)
@@ -2547,7 +2559,8 @@ def save_respect_rate_ci_plot(stats: Dict[str, Any], out_dir: str, regime: str):
     s = stats.get("all", {})
     rr = s.get("outcome_rates", {}).get("RESPECT")
     ci = s.get("outcome_rates_ci", {}).get("RESPECT")
-    if rr is None or not ci or ci[0] is None: return
+    if rr is None or not ci or ci[0] is None or not np.isfinite(rr):
+        return
     import matplotlib.pyplot as plt
     plt.figure(figsize=(6,4))
     plt.errorbar([0], [rr], yerr=[[max(0, rr - ci[0])], [max(0, ci[1] - rr)]], fmt="o", capsize=6)
@@ -3130,9 +3143,9 @@ def main():
                     for col in ("outcome", "zone_type"):
                         if col in episodes_df.columns:
                             episodes_df[col] = episodes_df[col].apply(lambda x: x.value if isinstance(x, Enum) else x)
-                    for col in ("touch_time", "outcome_time"):
+                    for col in ("touch_time", "outcome_time", "activation_time"):
                         if col in episodes_df.columns:
-                            episodes_df[col] = pd.to_datetime(episodes_df[col])
+                            episodes_df[col] = pd.to_datetime(episodes_df[col]).dt.tz_convert("UTC").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                     episodes_df.to_csv(
                         f"{args.out}/episodes_walkforward.csv", index=False
                     )
@@ -3156,6 +3169,10 @@ def main():
                         LOG.info(
                             f"Overall OOS Respect rate: {respect_rate:.2%} (CI: {f'({ci[0]:.2%}, {ci[1]:.2%})' if ci[0] is not None else 'N/A'})"
                         )
+                        LOG.info("--- Key Artifacts ---")
+                        LOG.info(f"OOS Summary: {os.path.join(args.out, 'summary_oos.csv')}")
+                        LOG.info(f"OOS Episodes: {os.path.join(args.out, 'episodes_walkforward.csv')}")
+                        LOG.info(f"WF README: {os.path.join(args.out, 'WF_README.txt')}")
             else:
                 all_results = run_analysis(df, config)
 
@@ -3269,6 +3286,13 @@ def main():
                     LOG.info(f"[{item['regime']:>12}] N={item['n_episodes']:5d} "
                              f"Respect={item['respect_rate']:.2%} ({_fmt_ci((item['respect_rate_ci_low'], item['respect_rate_ci_high']))})  "
                              f"Median bars={item['median_bars_to_outcome']}  CVaR95 adverse={item['cvar_95_adverse_excursion']:.2f} pts")
+
+                LOG.info("--- Key Artifacts ---")
+                LOG.info(f"Summary: {os.path.join(args.out, 'summary.csv')}")
+                LOG.info(f"Episodes: {os.path.join(args.out, 'episodes.csv')}")
+                LOG.info(f"Zones: {os.path.join(args.out, 'zones.csv')}")
+                if args.report:
+                    LOG.info(f"HTML Report: {os.path.join(args.out, 'report.html')}")
 
 
         elif args.command == "sweep":
@@ -3512,6 +3536,8 @@ def run_self_test():
     LOG.info(f"Self-test artifacts will be saved to: {out_dir}")
 
     # --- Generate Data ---
+    import random
+    random.seed(42)
     timestamps = pd.to_datetime(pd.date_range(start="2023-01-01 09:30", periods=200, freq="1min", tz="America/New_York"))
     price = 102.0
     prices = []

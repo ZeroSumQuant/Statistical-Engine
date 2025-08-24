@@ -1,0 +1,21 @@
+- episode:
+    R: 10
+    O: 5
+    T: 20
+  zones:
+    pivot_k: 5
+    zone_width_points: 12
+- episode:
+    R: 12
+    O: 6
+    T: 25
+  zones:
+    pivot_k: 7
+    zone_width_points: 15
+- episode:
+    R: 15
+    O: 7
+    T: 30
+  zones:
+    pivot_k: 9
+    zone_width_points: 18
