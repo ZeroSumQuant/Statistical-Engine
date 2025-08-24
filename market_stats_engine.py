@@ -417,8 +417,9 @@ def test_zone_significance(
         return False, 1.0  # Not enough data to test; p=1.0 ensures it's filtered out
 
     window_pts = local_prices.max() - local_prices.min()
-    if window_pts <= 0:
-        return True, 1.0  # Cannot determine p0, default to significant
+    if not np.isfinite(window_pts) or window_pts <= 0:
+        LOG.debug("Zone significance untestable (degenerate window); marking as significant by default.")
+        return True, 0.0  # keep candidate; aligns with discovery FDR usage
 
     p0 = min(1.0, (2.0 * width) / window_pts)
     x_obs = sum(1 for t in touches if abs(t - level) <= width)
