@@ -1,0 +1,7 @@
+polars
+pyarrow
+scipy
+statsmodels
+pytz
+tqdm
+numexpr

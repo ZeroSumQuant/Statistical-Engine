@@ -885,29 +885,26 @@ def annotate_regimes(df: pd.DataFrame, regime_config: RegimeConfig) -> pd.DataFr
     if not regime_config or not regime_config.enabled or not regime_config.regimes:
         return df
 
+    df_eval = df.copy()
+    if 'index' not in df_eval.columns:
+        df_eval['index'] = df_eval.index
+
     LOG.info(f"Annotating {len(regime_config.regimes)} market regimes...")
     for regime in regime_config.regimes:
         col_name = f"regime_{regime.name.lower().replace(' ', '_')}"
         try:
-            try:
-                # Prefer eval for richer expressions
-                mask = pd.eval(regime.condition, engine='python', target=df, local_dict={"np": np, "pd": pd})
-                mask = pd.Series(mask, index=df.index).astype(bool)
-            except Exception:
-                # Fallback to query for simple column filters
-                idx = df.query(regime.condition, engine='python').index
-                mask = df.index.isin(idx)
-            df[col_name] = mask.astype(bool)
-            LOG.debug(f"Annotated regime '{regime.name}' ({mask.sum()} bars)")
+            # Use numexpr for safe evaluation of regime conditions.
+            # This is safer than python's eval and is recommended for untrusted inputs.
+            mask = df_eval.eval(regime.condition, engine='numexpr')
+            df[col_name] = pd.Series(mask, index=df.index).astype(bool)
+            LOG.debug(f"Annotated regime '{regime.name}' ({df[col_name].sum()} bars)")
         except Exception as e:
-            log_msg = f"Failed to evaluate regime '{regime.name}': {regime.condition}. Error: {e}"
-            # Try to extract missing column name for better debugging
-            if isinstance(e, NameError) and "is not defined" in str(e):
-                try:
-                    missing_col = str(e).split("'")[1]
-                    log_msg += f" (Hint: missing column '{missing_col}'?)"
-                except IndexError:
-                    pass  # could not parse
+            log_msg = f"Failed to evaluate regime '{regime.name}' with condition '{regime.condition}'. Error: {e}"
+            if 'numexpr' in str(e) and 'is not installed' in str(e):
+                log_msg += " (Hint: `numexpr` is not installed. Please install it for safe regime evaluation.)"
+            elif "UndefinedVariableError" in str(type(e)) or "NameError" in str(type(e)):
+                 log_msg += f" (Hint: check for missing column in dataframe.)"
+
             LOG.warning(log_msg)
             df[col_name] = False
     return df
@@ -2636,6 +2633,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
     html += f"""
         <h3>Method Notes</h3>
         <ul>
+            <li><b>Outlier Policy:</b> Episodes with outlier bars are handled by the '<strong>{config.episode.outliers_policy}</strong>' policy.</li>
             <li><b>Censoring Policy:</b> Episodes are censored at session boundaries. Timeouts are treated as <b>{timeout_treatment}</b>.</li>
             <li><b>Bootstrap Block Size:</b> {block_size_str} bars used for CIs.</li>
             <li><b>Multiple Comparisons:</b> {"p-values adjusted for FDR (q-values shown)." if has_q else "statsmodels unavailable → unadjusted p-values shown; interpret cautiously."}</li>
@@ -3270,6 +3268,7 @@ def main():
                         "respect_rate_ci_high": ci[1] if ci else None,
                         "median_bars_to_outcome": med,
                         "cvar_95_adverse_excursion": cvar,
+                        "bootstrap_block_size": s.get("bootstrap_block_size")
                     })
 
                 if summary_data:
@@ -3285,7 +3284,8 @@ def main():
                 for item in summary_data:
                     LOG.info(f"[{item['regime']:>12}] N={item['n_episodes']:5d} "
                              f"Respect={item['respect_rate']:.2%} ({_fmt_ci((item['respect_rate_ci_low'], item['respect_rate_ci_high']))})  "
-                             f"Median bars={item['median_bars_to_outcome']}  CVaR95 adverse={item['cvar_95_adverse_excursion']:.2f} pts")
+                             f"Median bars={item['median_bars_to_outcome']}  CVaR95 adverse={item['cvar_95_adverse_excursion']:.2f} pts"
+                             f"  Block size={item.get('bootstrap_block_size', 'N/A')}")
 
                 LOG.info("--- Key Artifacts ---")
                 LOG.info(f"Summary: {os.path.join(args.out, 'summary.csv')}")

@@ -1,0 +1,59 @@
+
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Market Stats Report: NQ</title>
+        <style>
+            body { font-family: sans-serif; margin: 2em; }
+            h1, h2, h3 { color: #333; }
+            hr { margin: 2em 0; }
+            table { border-collapse: collapse; width: 100%; max-width: 900px; margin-bottom: 2em; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+            .summary-table td { font-size: 1.1em; text-align: center; }
+            .summary-table th { font-size: 0.9em; font-weight: normal; color: #666; }
+            .footer { margin-top: 2em; font-size: 0.8em; color: #666; }
+        </style>
+    </head>
+    <body>
+        <h1>Market Statistics Report: NQ</h1>
+        <p class="footer">Generated on 2025-08-24 22:37:55</p>
+
+        <div style="background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; padding: 1rem; margin-bottom: 1rem; border-radius: .25rem;">
+            <strong>Warning: Unadjusted p-values.</strong> The <code>statsmodels</code> library was not found, so p-values for cohort comparisons have not been adjusted for multiple comparisons (e.g., via FDR). Please interpret these results with caution.
+        </div>
+
+        <h3>Method Notes</h3>
+        <ul>
+            <li><b>Outlier Policy:</b> Episodes with outlier bars are handled by the '<strong>skip</strong>' policy.</li>
+            <li><b>Censoring Policy:</b> Episodes are censored at session boundaries. Timeouts are treated as <b>TIMEOUT</b>.</li>
+            <li><b>Bootstrap Block Size:</b> dynamic (T//2, default: 10) bars used for CIs.</li>
+            <li><b>Multiple Comparisons:</b> statsmodels unavailable → unadjusted p-values shown; interpret cautiously.</li>
+        </ul>
+
+        <hr>
+        <h3>Glossary of Terms</h3>
+        <dl>
+            <dt><strong>Respect</strong></dt>
+            <dd>Price touches the zone, exits favorably, and travels at least R points away without first breaking the zone.</dd>
+            <dt><strong>Pierce → Revert</strong></dt>
+            <dd>Price touches the zone, pierces into it (but not beyond the overshoot O), then reverts to travel R points in the favorable direction.</dd>
+            <dt><strong>Break</strong></dt>
+            <dd>Price closes beyond the zone plus the overshoot tolerance O.</dd>
+            <dt><strong>Timeout</strong></dt>
+            <dd>The episode is censored, either by reaching the maximum T bars or by a session boundary change, before a clear outcome is observed.</dd>
+        </dl>
+
+        <h3>Data Artifacts</h3>
+        <p>The following data files were generated alongside this report:</p>
+        <ul>
+            <li><a href="episodes.csv">episodes.csv</a></li>
+            <li><a href="zones.csv">zones.csv</a></li>
+            <li><a href="statistics.json">statistics.json</a></li>
+            <li><a href="summary.csv">summary.csv</a></li>
+            <li><a href="episodes_schema.json">episodes_schema.json</a></li>
+        </ul>
+
+    </body>
+    </html>

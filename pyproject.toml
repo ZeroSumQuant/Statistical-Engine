@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-stats-engine"
+version = "3.1.0"
+description = "A single-file, production-ready market statistical analysis engine."
+requires-python = ">=3.8"
+
+[project.scripts]
+market-stats-engine = "market_stats_engine:main"
