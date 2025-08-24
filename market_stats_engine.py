@@ -1749,7 +1749,7 @@ def _run_single_analysis(
             if HAVE_STATSMODELS and p_values:
                 try:
                     reject, q_values, _, _ = multipletests(
-                        p_values, alpha=ZONE_SIGNIFICANCE_ALPHA, method="fdr_bh"
+                        p_values, alpha=config.zones.alpha, method="fdr_bh"
                     )
                     for i, name in enumerate(cohort_names_for_correction):
                         if "comparative_respect_rate" in stratified_stats[name]:
@@ -2529,7 +2529,7 @@ def save_cohort_lift_plot(statistics: Dict[str, Any], out_dir: str, regime_name:
     colors = ["C0" if x > 0 else "C1" for x in df["lift"].tolist()]
     df["lift"].plot(kind="barh", color=colors)
     plt.title(f"Top 10 Cohorts by Respect Rate Lift (Regime: {regime_name})")
-    plt.xlabel("Lift over Baseline Respect Rate (pp)")
+    plt.xlabel("Lift (fraction)")
     plt.axvline(0, color="black", linestyle="--")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"plot_cohort_lift_{regime_name}.png"))
@@ -2672,7 +2672,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
                 continue
 
             is_sig = comp.get("reject_h0") if has_q else (
-                comp.get("p_value") is not None and comp["p_value"] < ZONE_SIGNIFICANCE_ALPHA
+                comp.get("p_value") is not None and comp["p_value"] < config.zones.alpha
             )
             if not is_sig:
                 continue
