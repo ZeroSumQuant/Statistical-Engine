@@ -501,7 +501,11 @@ def block_bootstrap_prop_ci(
         k = int(x.sum()); n = int(len(x))
         if HAVE_SCIPY:
             from scipy.stats import beta
-            return float(beta.ppf(alpha/2, k+0.5, n-k+0.5)), float(beta.ppf(1-alpha/2, k+0.5, n-k+0.5))
+            lo = float(beta.ppf(alpha/2, k+0.5, n-k+0.5))
+            hi = float(beta.ppf(1-alpha/2, k+0.5, n-k+0.5))
+            if not np.isfinite(lo) or not np.isfinite(hi):
+                return (0.0, 1.0)
+            return (lo, hi)
         # vanilla percentile bootstrap as last resort
         return standard_bootstrap_ci(x, np.mean, n_boot=n_boot, alpha=alpha, seed=seed)
 
@@ -896,7 +900,7 @@ def annotate_regimes(df: pd.DataFrame, regime_config: RegimeConfig) -> pd.DataFr
                     log_msg += f" (Hint: missing column '{missing_col}'?)"
                 except IndexError:
                     pass  # could not parse
-            LOG.error(log_msg)
+            LOG.warning(log_msg)
             df[col_name] = False
     return df
 
@@ -957,10 +961,10 @@ def merge_close_zones(zones: List["Zone"], tolerance: float) -> List["Zone"]:
                 # Keep both zones; append current instead of skipping
                 merged_zones.append(current_zone)
                 continue
+            w1, w2 = len(prev_zone.touches), len(current_zone.touches)
             new_level = (
-                (prev_zone.level * len(prev_zone.touches))
-                + (current_zone.level * len(current_zone.touches))
-            ) / total_touches
+                (prev_zone.level * w1) + (current_zone.level * w2)
+            ) / (w1 + w2)
             merged_zones[-1] = dataclasses.replace(
                 prev_zone,
                 level=new_level,
@@ -2063,7 +2067,10 @@ class SQLitePersistence:
     """Handles persistence of run data to a SQLite database."""
 
     def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA busy_timeout=30000;")
         self.conn.execute("PRAGMA foreign_keys = 1;")
         self.create_tables()
 
@@ -2217,7 +2224,7 @@ def save_distribution_plots(episodes_df: pd.DataFrame, out_dir: str, regime_name
         try:
             plt.style.use("seaborn-darkgrid")
         except Exception:
-            pass  # fall back to default
+            plt.rcdefaults()  # explicit default fallback
 
     outcome_labels = {
         "RESPECT": "Respect",
@@ -2342,9 +2349,9 @@ def save_daily_maps(
                     "BREAK": "orange",
                     "PIERCE_AND_REVERT": "purple",
                 }.get(outcome_str, "grey")
-                ix = df["timestamp"].searchsorted(episode["touch_time"])
-                ix = int(np.clip(ix, 1, len(df) - 1))
-                cand = df.iloc[[ix - 1, ix]]
+                ix = int(df["timestamp"].searchsorted(episode["touch_time"]))
+                ix = int(np.clip(ix, 0, len(df) - 1))
+                cand = df.iloc[[ix - 1, ix]] if ix > 0 else df.iloc[[ix]]
                 row = cand.iloc[
                     (cand["timestamp"] - episode["touch_time"]).abs().values.argmin()
                 ]
@@ -2558,7 +2565,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
 
     def embed_img(path: str) -> str:
         if not os.path.exists(path):
-            return ""
+            return "<em>(plot not generated)</em>"
         with open(path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode("utf-8")
         return f'<img src="data:image/png;base64,{encoded}" alt="{os.path.basename(path)}" style="width:100%; max-width:600px;">'
@@ -2826,7 +2833,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase log verbosity (-v or -vv)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Only show warnings and errors")
 
-    subparsers = parser.add_subparsers(dest="command", help="Commands", required=True)
+    try:
+        subparsers = parser.add_subparsers(dest="command", help="Commands", required=True)
+    except TypeError:
+        subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # --- Prepare Command ---
     prep_parser = subparsers.add_parser("prepare", help="Prepare and validate data")
@@ -3091,6 +3101,14 @@ def main():
                         "median_bars_to_outcome": med,
                         "cvar_95_adverse_excursion": cvar,
                     }]
+                    with open(os.path.join(args.out, "WF_README.txt"), "w") as f:
+                        f.write(
+                            "Notes:\n"
+                            "- OOS episodes are aggregated across regimes.\n"
+                            "- TIMEOUTs include censoring at session boundaries (EpisodeConfig.censor_on_session_change=True).\n"
+                            '- Treat timeouts as BREAK? %s\n' % ("YES" if config.episode.treat_timeout_as_break else "NO")
+                        )
+                    save_episodes_schema(args.out)
                     summary_df = pd.DataFrame(summary_data)
                     summary_df.to_csv(os.path.join(args.out, "summary_oos.csv"), index=False, float_format="%.4f")
                     LOG.info(f"Saved OOS summary metrics to {os.path.join(args.out, 'summary_oos.csv')}")
@@ -3406,6 +3424,8 @@ def run_sweep_item(args_tuple):
     param_hash = int(hashlib.sha256(param_bytes).hexdigest()[:8], 16)  # 32-bit-ish
     item_seed = (int(run_config.random_seed or 0) ^ param_hash) & 0xFFFFFFFF
     run_config.random_seed = item_seed
+    import random
+    random.seed(run_config.random_seed)
     np.random.seed(run_config.random_seed)
 
     persistence = SQLitePersistence(db_path) if db_path else None
