@@ -249,6 +249,7 @@ class InstrumentConfig:
     rth_start: str = "09:30"
     rth_end: str = "16:00"
     currency: str = "USD"
+    data_tz: Optional[str] = None  # e.g., "UTC" or "America/New_York"
 
     def __post_init__(self):
         # Validate time format
@@ -626,18 +627,27 @@ def _blk(config: EngineConfig) -> int:
     return int(bs) if (bs is not None and bs > 0) else max(5, config.episode.T // 2)
 
 
-def _ensure_utc_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_utc_timestamps(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
     """Ensures the timestamp column is a timezone-aware UTC timestamp."""
     if "timestamp" not in df.columns:
         raise ValueError("DataFrame must have a 'timestamp' column.")
     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"])
+
     if df["timestamp"].dt.tz is None:
-        LOG.info("Timestamp column is timezone-naive, localizing to UTC.")
-        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+        tz = config.instrument.data_tz or "UTC"
+        LOG.info(f"Timestamp column is timezone-naive, localizing to '{tz}' then converting to UTC.")
+        df["timestamp"] = df["timestamp"].dt.tz_localize(tz).dt.tz_convert("UTC")
     else:
         df["timestamp"] = df["timestamp"].dt.tz_convert("UTC")
     return df
+
+
+def _clip01(t: Tuple[float, float]) -> Tuple[float, float]:
+    """Clips a confidence interval tuple to the [0, 1] range."""
+    if not t or t[0] is None: return t
+    return (max(0.0, min(1.0, float(t[0]))),
+            max(0.0, min(1.0, float(t[1]))))
 
 
 ##############################################################################
@@ -767,7 +777,7 @@ def prepare_data(files: List[str], config: EngineConfig) -> pd.DataFrame:
                 f"Missing columns in {file}: {set(required) - set(df.columns)}"
             )
 
-        df = _ensure_utc_timestamps(df)
+        df = _ensure_utc_timestamps(df, config)
         df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
         df = annotate_sessions(df, config.instrument)
         df, report = validator.validate_and_clean(df)
@@ -822,8 +832,10 @@ def add_indicators(df: pd.DataFrame, config: IndicatorConfig) -> pd.DataFrame:
     gain = delta.clip(lower=0).ewm(span=config.rsi_n, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(span=config.rsi_n, adjust=False).mean()
     df["rsi"] = 100 - (100 / (1 + gain / (loss + 1e-12)))
-    if config.rvol_lookback_sessions > 0:
-        rolling_window = config.rvol_lookback_sessions * 390
+    if config.rvol_lookback_sessions > 0 and "session_date" in df.columns:
+        bars_per_session = int(df.groupby("session_date").size().median())
+        if bars_per_session == 0: bars_per_session = 390 # Fallback for safety
+        rolling_window = max(10, config.rvol_lookback_sessions * bars_per_session)
         df["avg_volume_lookback"] = (
             df["volume"]
             .rolling(window=rolling_window, min_periods=rolling_window // 10)
@@ -865,7 +877,7 @@ def annotate_regimes(df: pd.DataFrame, regime_config: RegimeConfig) -> pd.DataFr
 
 def ensure_prepared(df: pd.DataFrame, config: EngineConfig) -> pd.DataFrame:
     """Checks if data has been prepared, and if not, runs preparation steps."""
-    df = _ensure_utc_timestamps(df)
+    df = _ensure_utc_timestamps(df, config)
     if any(
         c not in df.columns
         for c in ["session_date", "minute_of_day", "is_rth", "local_time"]
@@ -1047,11 +1059,20 @@ def detect_zones_from_csv(
         return []
 
     candidate_zones = []
+    tick_size = instrument.tick_size
     for _, row in levels_df.iterrows():
-        level, width = row["level"], row["width"]
-        zone_type = (
-            ZoneType.SUPPORT if "supp" in row["type"].lower() else ZoneType.RESISTANCE
-        )
+        level = round_to_tick(row["level"], tick_size)
+        width = round_to_tick(row["width"], tick_size)
+
+        type_str = str(row.get("type", "")).lower()
+        if "supp" in type_str or type_str.startswith("s"):
+            zone_type = ZoneType.SUPPORT
+        elif "res" in type_str or type_str.startswith("r"):
+            zone_type = ZoneType.RESISTANCE
+        else:
+            LOG.warning(f"Skipping external level with unknown type: {row.get('type')}")
+            continue
+
         activation_time = pd.Timestamp(row["timestamp"], tz="UTC")
 
         touch_df = df[df["timestamp"] >= activation_time]
@@ -1814,8 +1835,9 @@ def compute_cvar(data: np.ndarray, alpha: float = 0.95) -> Optional[float]:
         return None
     a = np.asarray(data)
     if len(a) < 30:
+        # For small samples, this is a pragmatic tail-mean rather than a true CVaR.
         a = np.sort(a)
-        k = max(0, int(np.floor(alpha * len(a))))  # <- use alpha, not 0.95
+        k = max(0, int(np.floor(alpha * len(a))))
         # ensure at least one element in the tail
         return float(a[k:].mean() if k < len(a) else a[-1])
     var = np.percentile(a, alpha * 100)
@@ -1880,9 +1902,11 @@ def compute_statistics(
     )
     n_invalid, n_episodes = len(episodes) - len(valid_episodes), len(valid_episodes)
 
+    block_size = _blk(config)
     stats = {
         "n_episodes": n_episodes,
         "n_invalid_episodes": n_invalid,
+        "bootstrap_block_size": block_size,
         "outcome_distribution": {},
         "outcome_rates": {},
         "outcome_rates_ci": {},
@@ -1914,9 +1938,10 @@ def compute_statistics(
     for outcome_str, rate in stats["outcome_rates"].items():
         y = np.array([(1 if (e["outcome"].value if isinstance(e["outcome"], Enum) else e["outcome"]) == outcome_str else 0)
                       for e in valid_episodes], dtype=float)
-        stats["outcome_rates_ci"][outcome_str] = block_bootstrap_prop_ci(
+        ci = block_bootstrap_prop_ci(
             y, n_boot=3000, block_size=_blk(config), alpha=alpha, seed=config.random_seed
         )
+        stats["outcome_rates_ci"][outcome_str] = _clip01(ci)
 
     for metric_name in ["bars_to_outcome", "max_favorable", "max_adverse"]:
         data = np.array(
@@ -2556,6 +2581,7 @@ def generate_html_report(all_results: Dict[str, Any], out_dir: str, config: Engi
         html += f"""
             <hr>
             <h2>Regime: {regime_name}</h2>
+            <p><i><b>Method Notes for this regime:</b> Bootstrap block size: {all_stats.get('bootstrap_block_size', 'N/A')} bars.</i></p>
 
             <h3>Summary Metrics</h3>
             <table class="summary-table">
@@ -2703,8 +2729,8 @@ def get_episodes_schema() -> Dict[str, str]:
         "stoch_k_at_touch": "Stochastic %K value at the time of the touch.",
         "stoch_d_at_touch": "Stochastic %D value at the time of the touch.",
         "is_rth_at_touch": "Whether the touch occurred during Regular Trading Hours (RTH).",
-        "minute_of_day_at_touch": "The minute of the day (UTC) at the time of the touch.",
-        "hour_at_touch": "The hour of the day (UTC) at the time of the touch.",
+        "minute_of_day_at_touch": "The minute of the day (in session-local time) at the time of the touch.",
+        "hour_at_touch": "The hour of the day (in session-local time) at the time of the touch.",
         "atr_tercile": "The tercile (low, mid, high) of the ATR at touch, relative to other episodes.",
         "rvol_tercile": "The tercile (low, mid, high) of the relative volume at touch.",
         "stoch_tercile": "The tercile (low, mid, high) of the stochastic %K at touch.",
